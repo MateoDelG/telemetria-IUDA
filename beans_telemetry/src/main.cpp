@@ -3,6 +3,7 @@
 #include "DHT21Manager.h"
 #include "SensorData.h"
 #include "UbidotsManager.h"
+#include "TimeManager.h"
 
 const char* SSID = "Delga";
 const char* PASS = "Delga1213";
@@ -22,6 +23,9 @@ DHT21Manager dht_outdoor(dht_outdoor_PIN);
 
 UbidotsManager ubidots(UBIDOTS_TOKEN, SSID, PASS, DEVICE_LABEL, 120000);  // cada 5 segundos
 
+TimeManager timeManager("pool.ntp.org", -5 * 3600);  // Colombia GMT-5
+
+
 
 
 void readLuxSensors();
@@ -36,6 +40,7 @@ void setup() {
   setupLuxSensors();
   setupDHTSensors();
   ubidots.begin();
+  timeManager.begin();
   delay(1000);
 
 }
@@ -163,6 +168,7 @@ void updateData(){
   if (millis() - current_time >= update_time) {
     readLuxSensors();
     readDHTSensors();
+    Serial.println("Fecha y hora: " + timeManager.getDateTime());
     current_time = millis();
   }
   
