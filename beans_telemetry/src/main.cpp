@@ -36,7 +36,7 @@ void setup() {
   setupLuxSensors();
   setupDHTSensors();
   ubidots.begin();
-  delay(5000);
+  delay(1000);
 
 }
 
