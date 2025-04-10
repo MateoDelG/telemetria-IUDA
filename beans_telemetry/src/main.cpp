@@ -10,8 +10,10 @@ const char* PASS = "Delga1213";
 const char* UBIDOTS_TOKEN = "BBUS-k2DesIYqrGRk5133NrNl748KpgD6Nv";
 const char* DEVICE_LABEL = "beans-001";
 
-#define dht_indoor_PIN 19
-#define dht_outdoor_PIN 18
+#define dht_indoor_PIN 33
+#define dht_outdoor_PIN 25
+
+#define SENSOR_ENABLE 12
 
 // Crea tres sensores con diferentes direcciones I2C
 TSL2561Manager sensor_lux_1(TSL2561_ADDR_LOW, 0x29);   // 0x29
@@ -21,7 +23,7 @@ TSL2561Manager sensor_lux_3(TSL2561_ADDR_HIGH, 0x49);  // 0x49
 DHT21Manager dht_indoor(dht_indoor_PIN);
 DHT21Manager dht_outdoor(dht_outdoor_PIN);
 
-UbidotsManager ubidots(UBIDOTS_TOKEN, SSID, PASS, DEVICE_LABEL, 120000);  // cada 5 segundos
+UbidotsManager ubidots(UBIDOTS_TOKEN, SSID, PASS, DEVICE_LABEL, 60000);
 
 TimeManager timeManager("pool.ntp.org", -5 * 3600);  // Colombia GMT-5
 
@@ -36,8 +38,10 @@ void updateData();
 
 void setup() {
   Serial.begin(115200);
+  pinMode(SENSOR_ENABLE, OUTPUT);
+  digitalWrite(SENSOR_ENABLE, HIGH);
 
-  setupLuxSensors();
+  // setupLuxSensors();
   setupDHTSensors();
   ubidots.begin();
   timeManager.begin();
@@ -50,6 +54,9 @@ void loop() {
   updateData();
   ubidots.update();
   // delay(30000);
+  // readLuxSensors();
+  // readDHTSensors();
+  // delay(1000);
 }
 
 
@@ -166,9 +173,12 @@ void updateData(){
   static unsigned long int current_time = millis();
 
   if (millis() - current_time >= update_time) {
-    readLuxSensors();
+    digitalWrite(SENSOR_ENABLE, HIGH);
+    delay(1000); // Esperar a que el sensor se estabilice
+    // readLuxSensors();
     readDHTSensors();
     Serial.println("Fecha y hora: " + timeManager.getDateTime());
+    digitalWrite(SENSOR_ENABLE, LOW);
     current_time = millis();
   }
   
