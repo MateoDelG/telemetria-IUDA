@@ -4,6 +4,12 @@
 #include "SensorData.h"
 #include "UbidotsManager.h"
 #include "TimeManager.h"
+#include "WiFiPortalManager.h"
+#include "SDLogger.h"
+#include <esp_task_wdt.h>
+
+
+
 
 const char* SSID = "Delga";
 const char* PASS = "Delga1213";
@@ -15,10 +21,13 @@ const char* DEVICE_LABEL = "beans-001";
 
 #define SENSOR_ENABLE 12
 
+#define MODE_PIN 32
+
 // Crea tres sensores con diferentes direcciones I2C
 TSL2561Manager sensor_lux_1(TSL2561_ADDR_LOW, 0x29);   // 0x29
 TSL2561Manager sensor_lux_2(TSL2561_ADDR_FLOAT,0x39); // 0x39
 TSL2561Manager sensor_lux_3(TSL2561_ADDR_HIGH, 0x49);  // 0x49
+
 
 DHT21Manager dht_indoor(dht_indoor_PIN);
 DHT21Manager dht_outdoor(dht_outdoor_PIN);
@@ -27,9 +36,13 @@ UbidotsManager ubidots(UBIDOTS_TOKEN, SSID, PASS, DEVICE_LABEL, 60000);
 
 TimeManager timeManager("pool.ntp.org", -5 * 3600);  // Colombia GMT-5
 
+WiFiPortalManager wifiManager("Beans_telemetry", "12345678", MODE_PIN);
+
+SDLogger logger;
 
 
 
+void watchdogUpdate();
 void readLuxSensors();
 void setupLuxSensors();
 void setupDHTSensors();
@@ -40,8 +53,13 @@ void setup() {
   Serial.begin(115200);
   pinMode(SENSOR_ENABLE, OUTPUT);
   digitalWrite(SENSOR_ENABLE, HIGH);
+  // logger.begin();
+  wifiManager.begin();
 
-  // setupLuxSensors();
+  esp_task_wdt_init(20, true); //en segundos
+  esp_task_wdt_add(NULL);
+
+  setupLuxSensors();
   setupDHTSensors();
   ubidots.begin();
   timeManager.begin();
@@ -53,13 +71,29 @@ void loop() {
 
   updateData();
   ubidots.update();
+  // wifiManager.loop();
+  watchdogUpdate();
+
   // delay(30000);
   // readLuxSensors();
   // readDHTSensors();
   // delay(1000);
 }
 
+void watchdogUpdate() {
+  static unsigned long last_Check = 0;
+  esp_task_wdt_reset();  // Alimentar el WDT
+  if (millis() - last_Check > 10000) {
+    Serial.println("Alimentando el WDT...");
+    last_Check = millis();
 
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("⚠️ WiFi desconectado, reiniciando...");
+      ESP.restart();
+    }
+  }
+
+}
 void setupLuxSensors(){
   Wire.begin();
 
@@ -167,17 +201,19 @@ void readDHTSensors(){
 
   Serial.println("----------------------------------");
 }
-
 void updateData(){
-  static int update_time = 2000;
-  static unsigned long int current_time = millis();
+  static int update_time = 60000;
+  static unsigned long int current_time = millis() + update_time;
 
   if (millis() - current_time >= update_time) {
     digitalWrite(SENSOR_ENABLE, HIGH);
     delay(1000); // Esperar a que el sensor se estabilice
-    // readLuxSensors();
+    setupLuxSensors();
+    readLuxSensors();
     readDHTSensors();
-    Serial.println("Fecha y hora: " + timeManager.getDateTime());
+    String timestamp = timeManager.getDateTime();
+    // logger.logSensorData(timestamp);
+    Serial.println("Fecha y hora: " + timestamp);
     digitalWrite(SENSOR_ENABLE, LOW);
     current_time = millis();
   }

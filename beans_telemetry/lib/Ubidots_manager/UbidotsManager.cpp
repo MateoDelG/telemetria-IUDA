@@ -5,7 +5,7 @@ UbidotsManager::UbidotsManager(const char* token, const char* ssid, const char* 
   : _token(token), _ssid(ssid), _pass(pass), _deviceLabel(deviceLabel), _interval(interval), _ubidots(token) {}
 
 void UbidotsManager::begin() {
-  _ubidots.connectToWifi(_ssid, _pass);
+  // _ubidots.connectToWifi(_ssid, _pass);
   _ubidots.setCallback(callback);
   _ubidots.setup();
   reconnect();

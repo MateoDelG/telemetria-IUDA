@@ -22,3 +22,6 @@ float SensorData::getHumidityOutdoor() const    { return humidityOutdoor; }
 float SensorData::getLux1() const { return lux1; }
 float SensorData::getLux2() const { return lux2; }
 float SensorData::getLux3() const { return lux3; }
+
+
+

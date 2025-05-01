@@ -29,6 +29,7 @@ class SensorData {
     float lux1, lux2, lux3;
 };
 
+
 // Instancia global para acceso compartido
 extern SensorData sensorData;
 
