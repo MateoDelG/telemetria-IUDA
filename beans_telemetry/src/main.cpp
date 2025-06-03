@@ -7,6 +7,7 @@
 #include "TimeManager.h"
 #include "WiFiPortalManager.h"
 #include "SDLogger.h"
+#include "Alerts_manager.h"
 
 
 
@@ -27,7 +28,7 @@ const char* DEVICE_LABEL = "beans-001";
 TSL2561Manager  tslSensor(TSL2561_ADDR_FLOAT, 0x39);   // 0x29
 VEML7700Manager vemlSensor;
 BH1750Manager bh;
-
+/////////////////////////
 
 DHT21Manager dht_indoor(dht_indoor_PIN);
 DHT21Manager dht_outdoor(dht_outdoor_PIN);
@@ -40,6 +41,7 @@ WiFiPortalManager wifiManager("Beans_telemetry", "12345678", MODE_PIN);
 
 SDLogger logger;
 
+DebugLeds debugLeds;
 
 
 void watchdogUpdate();
@@ -48,21 +50,32 @@ void setupLuxSensors();
 void setupDHTSensors();
 void readDHTSensors();
 void updateData();
+void LEDDebug();
 
 void setup() {
   Serial.begin(115200);
 
   delay(3000);
-  // logger.begin();
-  // wifiManager.begin();
 
-  // esp_task_wdt_init(20, true); //en segundos
-  // esp_task_wdt_add(NULL);
+  debugLeds.begin();
+  // Prueba inicial: LED 0 en rojo sólido
+  debugLeds.setColor(0, 255, 0, 0);  // LED 0 - Rojo
+
+
+  // logger.begin();
+  wifiManager.begin();
+    debugLeds.setColor(0, 255, 100, 0);
+
+
+  esp_task_wdt_init(20, true); //en segundos
+  esp_task_wdt_add(NULL);
   setupLuxSensors();
   setupDHTSensors();
+  debugLeds.setColor(0, 100, 100, 0);
   // ubidots.begin();
-  // timeManager.begin();
-  delay(1000);
+  timeManager.begin();
+  debugLeds.setColor(0, 0, 100, 0);
+
 
 }
 
@@ -70,16 +83,17 @@ void loop() {
 
   updateData();
   // ubidots.update();
-  // wifiManager.loop();
-  // watchdogUpdate();
+  wifiManager.loop();
+  watchdogUpdate();
 
   // delay(30000);
   // readLuxSensors();
   // readDHTSensors();
-  delay(1000);
+  // delay(1000);
   // digitalWrite(SENSOR_ENABLE, HIGH);  // Desactivar sensores
   // delay(1000);  // Esperar un segundo para estabilizar
   // digitalWrite(SENSOR_ENABLE, LOW);  // Activar sensores
+  LEDDebug();
 }
 
 void watchdogUpdate() {
@@ -219,6 +233,25 @@ void updateData(){
     // logger.logSensorData(timestamp);
     Serial.println("Fecha y hora: " + timestamp);
     current_time = millis();
+  }
+}
+
+void LEDDebug() {
+debugLeds.update();
+
+  static unsigned long lastFade = 0;
+  static const uint16_t fadeDuration = 1000;
+  static bool fadingOut = false;
+
+  // Verifica si terminó el último fade
+  if (millis() - lastFade > fadeDuration) {
+    if (fadingOut) {
+      debugLeds.setFade(1, 0, 0, 255, fadeDuration); // Azul
+    } else {
+      debugLeds.setFade(1, 0, 0, 0, fadeDuration);   // Negro
+    }
+    fadingOut = !fadingOut;
+    lastFade = millis();
   }
 }
 

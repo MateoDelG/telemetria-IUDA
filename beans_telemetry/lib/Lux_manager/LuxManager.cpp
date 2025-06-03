@@ -69,7 +69,21 @@ void VEML7700Manager::configureSensor() {
 }
 
 float VEML7700Manager::readLux() {
-  return veml.readLux();
+  // Validación de conexión básica
+  Wire.beginTransmission(VEML7700_I2CADDR_DEFAULT);  // Dirección por defecto: 0x10
+  if (Wire.endTransmission() != 0) {
+    Serial.println("[VEML7700] Error: Sensor no responde en el bus I2C.");
+    return -1.0;
+  }
+
+  // Intentar leer lux
+  float lux = veml.readLux();
+  if (lux < 0.0 || isnan(lux)) {
+    Serial.println("[VEML7700] Error: Lectura inválida.");
+    return -1.0;
+  }
+
+  return lux;
 }
 
 
