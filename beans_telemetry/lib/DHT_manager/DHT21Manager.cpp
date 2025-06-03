@@ -5,6 +5,7 @@ DHT21Manager::DHT21Manager(uint8_t pin)
 
 void DHT21Manager::begin() {
   dht.begin();
+
 }
 
 float DHT21Manager::readTemperature() {

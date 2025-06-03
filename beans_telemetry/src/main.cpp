@@ -1,12 +1,12 @@
 #include <Arduino.h>
-#include "TSL2561Manager.h"
+#include <esp_task_wdt.h>
+#include "LuxManager.h"
 #include "DHT21Manager.h"
 #include "SensorData.h"
 #include "UbidotsManager.h"
 #include "TimeManager.h"
 #include "WiFiPortalManager.h"
 #include "SDLogger.h"
-#include <esp_task_wdt.h>
 
 
 
@@ -16,17 +16,17 @@ const char* PASS = "Delga1213";
 const char* UBIDOTS_TOKEN = "BBUS-k2DesIYqrGRk5133NrNl748KpgD6Nv";
 const char* DEVICE_LABEL = "beans-001";
 
-#define dht_indoor_PIN 33
-#define dht_outdoor_PIN 25
+#define dht_indoor_PIN 18
+#define dht_outdoor_PIN 4
 
-#define SENSOR_ENABLE 12
+#define SENSOR_ENABLE 13
 
 #define MODE_PIN 32
 
 // Crea tres sensores con diferentes direcciones I2C
-TSL2561Manager sensor_lux_1(TSL2561_ADDR_LOW, 0x29);   // 0x29
-TSL2561Manager sensor_lux_2(TSL2561_ADDR_FLOAT,0x39); // 0x39
-TSL2561Manager sensor_lux_3(TSL2561_ADDR_HIGH, 0x49);  // 0x49
+TSL2561Manager  tslSensor(TSL2561_ADDR_FLOAT, 0x39);   // 0x29
+VEML7700Manager vemlSensor;
+BH1750Manager bh;
 
 
 DHT21Manager dht_indoor(dht_indoor_PIN);
@@ -51,18 +51,17 @@ void updateData();
 
 void setup() {
   Serial.begin(115200);
-  pinMode(SENSOR_ENABLE, OUTPUT);
-  digitalWrite(SENSOR_ENABLE, HIGH);
+
+  delay(3000);
   // logger.begin();
-  wifiManager.begin();
+  // wifiManager.begin();
 
-  esp_task_wdt_init(20, true); //en segundos
-  esp_task_wdt_add(NULL);
-
+  // esp_task_wdt_init(20, true); //en segundos
+  // esp_task_wdt_add(NULL);
   setupLuxSensors();
   setupDHTSensors();
-  ubidots.begin();
-  timeManager.begin();
+  // ubidots.begin();
+  // timeManager.begin();
   delay(1000);
 
 }
@@ -70,14 +69,17 @@ void setup() {
 void loop() {
 
   updateData();
-  ubidots.update();
+  // ubidots.update();
   // wifiManager.loop();
-  watchdogUpdate();
+  // watchdogUpdate();
 
   // delay(30000);
   // readLuxSensors();
   // readDHTSensors();
-  // delay(1000);
+  delay(1000);
+  // digitalWrite(SENSOR_ENABLE, HIGH);  // Desactivar sensores
+  // delay(1000);  // Esperar un segundo para estabilizar
+  // digitalWrite(SENSOR_ENABLE, LOW);  // Activar sensores
 }
 
 void watchdogUpdate() {
@@ -94,72 +96,73 @@ void watchdogUpdate() {
   }
 
 }
+
 void setupLuxSensors(){
   Wire.begin();
 
-  if (!sensor_lux_1.begin()) {
-    Serial.println("Error al iniciar sensor_lux_1");
+  if (!tslSensor.begin()) {
+    Serial.println("Error al iniciar tslSensor");
   } else {
-    sensor_lux_1.displaySensorDetails();
-    sensor_lux_1.configureSensor();
+    tslSensor.displaySensorDetails();
+    tslSensor.configureSensor();
   }
 
-  if (!sensor_lux_2.begin()) {
-    Serial.println("Error al iniciar sensor_lux_2");
+  if (!vemlSensor.begin()) {
+    Serial.println("Error al iniciar vemlSensor");
   } else {
-    sensor_lux_2.displaySensorDetails();
-    sensor_lux_2.configureSensor();
+    vemlSensor.configureSensor();
   }
 
-  if (!sensor_lux_3.begin()) {
-    Serial.println("Error al iniciar sensor_lux_3");
+  if (!bh.begin()) {
+    Serial.println("Error al iniciar bh");
   } else {
-    sensor_lux_3.displaySensorDetails();
-    sensor_lux_3.configureSensor();
+    bh.configureSensor();
   }
 }
 void readLuxSensors() {
   float value;
 
-  value = sensor_lux_1.readLux();
+  value = tslSensor.readLux();
   if (value >= 0) {
     sensorData.setLux1(value);
   } else {
     sensorData.setLux1(-1);  // Valor inválido para representar saturación
   }
 
-  value = sensor_lux_2.readLux();
+  value = vemlSensor.readLux();
   if (value >= 0) {
     sensorData.setLux2(value);
   } else {
-    sensorData.setLux2(-1);
+    sensorData.setLux2(-1);  // Valor inválido para representar saturación
   }
 
-  value = sensor_lux_3.readLux();
+  value = bh.readLux();
   if (value >= 0) {
     sensorData.setLux3(value);
   } else {
-    sensorData.setLux3(-1);
+    sensorData.setLux3(-1);  // Valor inválido para representar saturación
   }
 
   // Mostrar resultados desde SensorData
-  Serial.print("Sensor 1: ");
+  Serial.print("Sensor tsl: ");
   if (sensorData.getLux1() >= 0) Serial.print(sensorData.getLux1());
   else Serial.print("Saturado");
   Serial.println(" lux");
 
-  Serial.print("Sensor 2: ");
+  Serial.print("Sensor veml: ");
   if (sensorData.getLux2() >= 0) Serial.print(sensorData.getLux2());
-  else Serial.print("Saturado");
+  else Serial.print("Saturado"); 
   Serial.println(" lux");
 
-  Serial.print("Sensor 3: ");
+  Serial.print("Sensor bh: ");
   if (sensorData.getLux3() >= 0) Serial.print(sensorData.getLux3());
   else Serial.print("Saturado");
   Serial.println(" lux");
 
+
   Serial.println("----------------------------");
 }
+
 void setupDHTSensors(){
   dht_indoor.begin();
   dht_outdoor.begin();
@@ -201,21 +204,70 @@ void readDHTSensors(){
 
   Serial.println("----------------------------------");
 }
+void stopLuxSensors() {
+  Wire.end();
+  Serial.println("I2C detenido");
+}
 void updateData(){
-  static int update_time = 60000;
+  static int update_time = 5000;
   static unsigned long int current_time = millis() + update_time;
 
   if (millis() - current_time >= update_time) {
-    digitalWrite(SENSOR_ENABLE, HIGH);
-    delay(1000); // Esperar a que el sensor se estabilice
-    setupLuxSensors();
     readLuxSensors();
     readDHTSensors();
     String timestamp = timeManager.getDateTime();
     // logger.logSensorData(timestamp);
     Serial.println("Fecha y hora: " + timestamp);
-    digitalWrite(SENSOR_ENABLE, LOW);
     current_time = millis();
   }
-  
 }
+
+
+
+
+
+
+
+
+
+
+// #include <Arduino.h>
+// #include <Wire.h>
+
+// void setup() {
+//   Serial.begin(115200);
+//   delay(1000); // Esperar a que abra el monitor serial
+
+//   // Iniciar el bus I2C en los pines por defecto del ESP32 (SDA=21, SCL=22)
+//   Wire.begin(21, 22);  // Puedes cambiar estos valores si usas otros pines
+
+//   Serial.println("Iniciando escaneo de dispositivos I2C...");
+
+//   byte count = 0;
+
+//   for (byte address = 1; address < 127; address++) {
+//     Wire.beginTransmission(address);
+//     byte error = Wire.endTransmission();
+
+//     if (error == 0) {
+//       Serial.print("Dispositivo I2C encontrado en 0x");
+//       Serial.println(address, HEX);
+//       count++;
+//     }
+//     else if (error == 4) {
+//       Serial.print("Error desconocido en dirección 0x");
+//       Serial.println(address, HEX);
+//     }
+//   }
+
+//   if (count == 0) {
+//     Serial.println("No se encontraron dispositivos I2C.");
+//   } else {
+//     Serial.print("Total encontrados: ");
+//     Serial.println(count);
+//   }
+// }
+
+// void loop() {
+//   // No se necesita hacer nada en el loop
+// }
