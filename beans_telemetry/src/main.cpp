@@ -17,12 +17,12 @@ const char* PASS = "Delga1213";
 const char* UBIDOTS_TOKEN = "BBUS-k2DesIYqrGRk5133NrNl748KpgD6Nv";
 const char* DEVICE_LABEL = "beans-001";
 
-#define dht_indoor_PIN 18
-#define dht_outdoor_PIN 4
+#define dht_indoor_PIN 32
+#define dht_outdoor_PIN 33
 
-#define SENSOR_ENABLE 13
+#define SENSOR_ENABLE 39
 
-#define MODE_PIN 32
+#define MODE_PIN 34
 
 // Crea tres sensores con diferentes direcciones I2C
 TSL2561Manager  tslSensor(TSL2561_ADDR_FLOAT, 0x39);   // 0x29
@@ -55,24 +55,23 @@ void LEDDebug();
 void setup() {
   Serial.begin(115200);
 
-  delay(3000);
+  // delay(3000);
 
   debugLeds.begin();
+  debugLeds.setColor(0, 0, 255, 0);  // LED 0 - Rojo
+  delay(300);
   // Prueba inicial: LED 0 en rojo sólido
   debugLeds.setColor(0, 255, 0, 0);  // LED 0 - Rojo
-
-
   // logger.begin();
   wifiManager.begin();
-    debugLeds.setColor(0, 255, 100, 0);
-
+  debugLeds.setColor(0, 255, 100, 0);
 
   esp_task_wdt_init(20, true); //en segundos
   esp_task_wdt_add(NULL);
   setupLuxSensors();
   setupDHTSensors();
   debugLeds.setColor(0, 100, 100, 0);
-  // ubidots.begin();
+  ubidots.begin();
   timeManager.begin();
   debugLeds.setColor(0, 0, 100, 0);
 
@@ -82,9 +81,10 @@ void setup() {
 void loop() {
 
   updateData();
-  // ubidots.update();
+  ubidots.update();
   wifiManager.loop();
   watchdogUpdate();
+  LEDDebug();
 
   // delay(30000);
   // readLuxSensors();
@@ -93,7 +93,6 @@ void loop() {
   // digitalWrite(SENSOR_ENABLE, HIGH);  // Desactivar sensores
   // delay(1000);  // Esperar un segundo para estabilizar
   // digitalWrite(SENSOR_ENABLE, LOW);  // Activar sensores
-  LEDDebug();
 }
 
 void watchdogUpdate() {
@@ -256,51 +255,3 @@ debugLeds.update();
 }
 
 
-
-
-
-
-
-
-
-
-// #include <Arduino.h>
-// #include <Wire.h>
-
-// void setup() {
-//   Serial.begin(115200);
-//   delay(1000); // Esperar a que abra el monitor serial
-
-//   // Iniciar el bus I2C en los pines por defecto del ESP32 (SDA=21, SCL=22)
-//   Wire.begin(21, 22);  // Puedes cambiar estos valores si usas otros pines
-
-//   Serial.println("Iniciando escaneo de dispositivos I2C...");
-
-//   byte count = 0;
-
-//   for (byte address = 1; address < 127; address++) {
-//     Wire.beginTransmission(address);
-//     byte error = Wire.endTransmission();
-
-//     if (error == 0) {
-//       Serial.print("Dispositivo I2C encontrado en 0x");
-//       Serial.println(address, HEX);
-//       count++;
-//     }
-//     else if (error == 4) {
-//       Serial.print("Error desconocido en dirección 0x");
-//       Serial.println(address, HEX);
-//     }
-//   }
-
-//   if (count == 0) {
-//     Serial.println("No se encontraron dispositivos I2C.");
-//   } else {
-//     Serial.print("Total encontrados: ");
-//     Serial.println(count);
-//   }
-// }
-
-// void loop() {
-//   // No se necesita hacer nada en el loop
-// }

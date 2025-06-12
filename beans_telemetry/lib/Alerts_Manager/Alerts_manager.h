@@ -6,7 +6,7 @@
 #include <Adafruit_NeoPixel.h>
 
 #define LED_COUNT 2
-#define LED_PIN 15  // Cambia según tu conexión
+#define LED_PIN 25  // Cambia según tu conexión
 
 
 // Estructura de estado para cada LED
