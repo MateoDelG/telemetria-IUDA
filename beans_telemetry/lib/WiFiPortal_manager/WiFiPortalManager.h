@@ -2,6 +2,10 @@
 #define WIFI_PORTAL_MANAGER_H
 
 #include <WiFiManager.h>
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <WiFiServer.h>
+#include <ArduinoOTA.h>
 
 class WiFiPortalManager {
 public:
@@ -21,5 +25,26 @@ private:
     int _apTriggerPin;
     bool _apModeEnabled = false;
 };
+
+class RemoteAccessManager {
+public:
+    RemoteAccessManager(const char* hostname = "BeansIOT");
+
+    void begin();
+    void handle();
+    void log(const String& message);
+
+private:
+    const char* _hostname;
+
+    WiFiServer _telnetServer;
+    WiFiClient _telnetClient;
+
+    void setupTelnet();
+    void setupOTA();
+    void handleTelnet();
+};
+
+
 
 #endif

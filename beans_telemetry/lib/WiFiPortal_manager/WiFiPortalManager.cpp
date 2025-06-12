@@ -60,3 +60,70 @@ IPAddress WiFiPortalManager::getLocalIP() {
 IPAddress WiFiPortalManager::getAPIP() {
     return WiFi.softAPIP();
 }
+
+
+//Remote access manager implementation
+
+RemoteAccessManager::RemoteAccessManager(const char* hostname)
+    : _hostname(hostname), _telnetServer(23) {}
+
+void RemoteAccessManager::begin() {
+    setupTelnet();
+    setupOTA();
+}
+
+void RemoteAccessManager::handle() {
+    ArduinoOTA.handle();
+    handleTelnet();
+}
+
+void RemoteAccessManager::log(const String& message) {
+    Serial.println(message);
+    if (_telnetClient && _telnetClient.connected()) {
+        _telnetClient.println(message);
+    }
+}
+
+void RemoteAccessManager::setupTelnet() {
+    _telnetServer.begin();
+    _telnetServer.setNoDelay(true);
+    Serial.println("📡 Telnet iniciado en puerto 23");
+}
+
+void RemoteAccessManager::handleTelnet() {
+    if (_telnetServer.hasClient()) {
+        if (_telnetClient && _telnetClient.connected()) {
+            WiFiClient newClient = _telnetServer.available();
+            newClient.println("❌ Solo se permite una conexión Telnet.");
+            newClient.stop();
+        } else {
+            _telnetClient = _telnetServer.available();
+            _telnetClient.println("✅ Conexión Telnet aceptada.");
+        }
+    }
+
+    if (_telnetClient && _telnetClient.available()) {
+        String command = _telnetClient.readStringUntil('\n');
+        command.trim();
+        if (command == "reboot") {
+            _telnetClient.println("♻️ Reiniciando...");
+            delay(1000);
+            ESP.restart();
+        }
+    }
+}
+
+void RemoteAccessManager::setupOTA() {
+    ArduinoOTA.setHostname(_hostname);
+    ArduinoOTA.onStart([]() {
+        Serial.println("🔄 OTA iniciada...");
+    });
+    ArduinoOTA.onEnd([]() {
+        Serial.println("✅ OTA completada");
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+        Serial.printf("❌ Error OTA: %u\n", error);
+    });
+    ArduinoOTA.begin();
+    Serial.println("🚀 OTA habilitado");
+}
