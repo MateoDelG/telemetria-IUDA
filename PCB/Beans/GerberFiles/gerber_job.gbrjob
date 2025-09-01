@@ -1,0 +1,24 @@
+{
+    "Header": {
+        "Comment": "All values are metric (mm)",
+        "CreationDate": "2025-04-05T21:10:05Z",
+        "GenerationSoftware": {
+            "Application": "Fusion Electronics",
+            "Vendor": "Autodesk",
+            "Version": "9.7.0"
+        },
+        "Part": "Single"
+    },
+    "Overall": {
+        "BoardThickness": 1.57,
+        "LayerNumber": 2,
+        "Name": {
+            "ProjectId": "beans_telemetry v8"
+        },
+        "Owner": "Mateo Del Gallego <mateodelgallego@gmail.com>",
+        "Size": {
+            "X": 137.14,
+            "Y": 82.22
+        }
+    }
+}
