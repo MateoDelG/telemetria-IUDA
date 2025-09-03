@@ -1,3 +1,5 @@
+#ifndef LCD_MANAGER_H
+#define LCD_MANAGER_H
 #include <Arduino.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
@@ -53,3 +55,5 @@ private:
   uint16_t _marqueeSpeed = 250;
   unsigned long _marqueeLast = 0;
 };
+
+#endif // LCD_MANAGER_H

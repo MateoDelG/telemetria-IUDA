@@ -9,19 +9,22 @@
 #include "SDLogger.h"
 #include "Alerts_manager.h"
 #include "LCD_manager.h"
+#include <globals.h>
 
 const char *SSID = "Delga";
 const char *PASS = "Delga1213";
 const char *UBIDOTS_TOKEN = "BBUS-k2DesIYqrGRk5133NrNl748KpgD6Nv";
 const char *DEVICE_LABEL = "beans_lab_001";
+#define TELNET_HOSTNAME "Beans_telemetry"
+
 
 #define dht_indoor_PIN 33
 #define dht_outdoor_PIN 32
 
 
 #define MODE_PIN 36
-#define BTN_A  35 
-#define BTN_B  34
+#define BTN_A  34 
+#define BTN_B  35
 
 // Crea tres sensores con diferentes direcciones I2C
 TSL2561Manager tslSensor(TSL2561_ADDR_FLOAT, 0x39); // 0x29
@@ -36,8 +39,8 @@ UbidotsManager ubidots(UBIDOTS_TOKEN, SSID, PASS, DEVICE_LABEL, 60000);
 
 TimeManager timeManager("pool.ntp.org", -5 * 3600); // Colombia GMT-5
 
-WiFiPortalManager wifiManager("Beans_telemetry", "12345678", MODE_PIN);
-RemoteAccessManager remoteManager("Beans_telemetry");
+WiFiPortalManager wifiManager("Beans_telemetry", "12345678", BTN_A);
+RemoteAccessManager remoteManager(TELNET_HOSTNAME);
 
 SDLogger logger;
 
@@ -427,6 +430,12 @@ void renderPageSimple(int page) {
       lcd.centerPrint(1, String(timeManager.getDateTime()));
     } break;
 
+    case 6: { // TELNET
+      lcd.clear();
+      lcd.centerPrint(0, "Telnet host");
+      lcd.centerPrint(1, TELNET_HOSTNAME);
+    } break;
+
     default: {
       lcd.clear();
       lcd.centerPrint(0, "Sin pantalla");
@@ -438,7 +447,7 @@ void renderPageSimple(int page) {
 void uiUpdate() {
   // Estado persistente, pero encapsulado aquí
   static int currentPage = 0;
-  static const int numPages = 6;             // actualiza si agregas más cases
+  static const int numPages = 7;             // actualiza si agregas más cases
   static unsigned long lastRedraw = 0;
   static bool btnA_last = HIGH, btnB_last = HIGH;
   static unsigned long btnA_tlast = 0, btnB_tlast = 0;

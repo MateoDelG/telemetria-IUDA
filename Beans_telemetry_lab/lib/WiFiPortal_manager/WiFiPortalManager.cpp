@@ -2,17 +2,23 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 
+
 WiFiPortalManager::WiFiPortalManager(const char* apName, const char* apPassword, int apTriggerPin)
     : _apName(apName), _apPassword(apPassword), _apTriggerPin(apTriggerPin) {}
 
     void WiFiPortalManager::begin() {
-        pinMode(_apTriggerPin, INPUT_PULLUP);  // Se asume pulsador con pull-up
+        // pinMode(_apTriggerPin, INPUT_PULLUP);  // Se asume pulsador con pull-up
         // if (_apTriggerPin != -1) {
         // }
     
         // Si el pin está en LOW: solo activar modo AP y servir el portal
         if (_apTriggerPin == -1 || digitalRead(_apTriggerPin) == LOW) {
+            lcd.clear();
+            lcd.centerPrint(0, "Iniciando AP");
+            lcd.centerPrint(1, _apName);
+           
             _apModeEnabled = true;
+
             WiFi.mode(WIFI_AP);  // Solo AP
             WiFi.softAP(_apName, _apPassword);
             Serial.print("📡 Modo configuración: AP activo en IP ");
@@ -20,6 +26,7 @@ WiFiPortalManager::WiFiPortalManager(const char* apName, const char* apPassword,
     
             wm.setConfigPortalBlocking(true);
             wm.startConfigPortal(_apName, _apPassword);  // Se queda aquí sirviendo el portal
+
     
             // No se ejecuta nada más
             return;

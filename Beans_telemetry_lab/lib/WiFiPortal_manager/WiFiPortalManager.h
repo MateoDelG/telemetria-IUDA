@@ -6,6 +6,8 @@
 #include <WiFiClient.h>
 #include <WiFiServer.h>
 #include <ArduinoOTA.h>
+#include <globals.h>
+
 
 class WiFiPortalManager {
 public:
