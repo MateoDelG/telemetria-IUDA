@@ -39,9 +39,22 @@ void TSL2561Manager::configureSensor() {
 }
 
 float TSL2561Manager::readLux() {
+  uint16_t ir = 0, full = 0;
+  tsl.getLuminosity(&ir, &full);
+
+  // Error típico de desconexión I2C
+  if (ir == 0xFFFF || full == 0xFFFF) return -1.0;
+
   sensors_event_t event;
-  tsl.getEvent(&event);
-  return event.light ? event.light : -1.0;  // Devuelve -1 si hay saturación
+  if (!tsl.getEvent(&event)) return -1.0;
+
+  // NaN o infinito -> inválido
+  if (!isfinite(event.light)) return -1.0;
+
+  // Valores negativos no tienen sentido
+  if (event.light < 0.0f) return -1.0;
+
+  return event.light;  // conserva los valores altos válidos
 }
 
 

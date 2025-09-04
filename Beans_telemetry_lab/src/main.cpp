@@ -62,6 +62,7 @@ void uiUpdate();
 void setup()
 {
   Serial.begin(115200);
+  sensorData.setSensorsErrorState(false);
   uiSetup();
   setupLCD();
 
@@ -132,6 +133,20 @@ void watchdogUpdate()
     {
       // Serial.println("⚠️ WiFi desconectado, reiniciando...");
       remoteManager.log("⚠️ WiFi desconectado, reiniciando...");
+      lcd.clear();
+      lcd.centerPrint(0, "ERROR DE WIFI");
+      lcd.centerPrint(1, "Reiniciando...");
+      delay(3000);
+      ESP.restart();
+    }
+    
+    if(sensorData.getSensorsErrorState()){
+      // Serial.println("⚠️ Error en lectura de lux, reiniciando...");
+      remoteManager.log("⚠️ Error en lectura de sensores, reiniciando...");
+      lcd.clear();
+      lcd.centerPrint(0, "ERROR DE SENSOR");
+      lcd.centerPrint(1, "Reiniciando...");
+      delay(3000);
       ESP.restart();
     }
   }
@@ -185,6 +200,7 @@ void readLuxSensors()
   else
   {
     sensorData.setLux1(-1); // Valor inválido para representar saturación
+    sensorData.setSensorsErrorState(true);
   }
 
   value = vemlSensor.readLux();
@@ -195,6 +211,7 @@ void readLuxSensors()
   else
   {
     sensorData.setLux2(-1); // Valor inválido para representar saturación
+    sensorData.setSensorsErrorState(true);
   }
 
   value = bh.readLux();
@@ -205,7 +222,24 @@ void readLuxSensors()
   else
   {
     sensorData.setLux3(-1); // Valor inválido para representar saturación
+    sensorData.setSensorsErrorState(true);
   }
+  //1:tsl, 2:veml, 3:bh
+  if(sensorData.getLux1() == 0 && sensorData.getLux2() != 0 && sensorData.getLux3() != 0){
+    remoteManager.log(" Error en lectura de VEML7700");
+    sensorData.setSensorsErrorState(true);
+  }
+  else if (sensorData.getLux1() != 0 && sensorData.getLux2() == 0 && sensorData.getLux3() != 0){
+  remoteManager.log(" Error en lectura de TSL2561");
+  sensorData.setSensorsErrorState(true);
+  }
+  else if (sensorData.getLux1() == 0 && sensorData.getLux2() == 0 && sensorData.getLux3() != 0){
+    remoteManager.log(" Error en lectura de BH1750");
+    sensorData.setSensorsErrorState(true);
+  }
+
+
+  
 
   // Mostrar resultados desde SensorData
   // Serial.print("Sensor tsl: ");
@@ -290,7 +324,7 @@ void readDHTSensors()
   // }
 
   Serial.println("Sensor Outdoor:");
-  if (sensorData.getTemperatureOutdoor() > -100.0)
+  if (sensorData.getTemperatureOutdoor() > -1)
   {
     // Serial.print("  Temperatura: ");
     // Serial.print(sensorData.getTemperatureOutdoor());
@@ -301,6 +335,7 @@ void readDHTSensors()
   {
     // Serial.println("  Error al leer temperatura");
     remoteManager.log("  Error al leer temperatura Outdoor");
+    sensorData.setSensorsErrorState(true);
   }
 
   if (sensorData.getHumidityOutdoor() >= 0)
@@ -314,6 +349,8 @@ void readDHTSensors()
   {
     // Serial.println("  Error al leer humedad");
     remoteManager.log("  Error al leer humedad Outdoor");
+    sensorData.setSensorsErrorState(true);
+
   }
 
   // Serial.println("----------------------------------");
@@ -453,7 +490,7 @@ void uiUpdate() {
   static unsigned long btnA_tlast = 0, btnB_tlast = 0;
 
   const unsigned long UI_REDRAW_MS = 2000;    // refresco suave
-  const unsigned long DEBOUNCE_MS  = 40;
+  const unsigned long DEBOUNCE_MS  = 100;
 
   unsigned long now = millis();
 

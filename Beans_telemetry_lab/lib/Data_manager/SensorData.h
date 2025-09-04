@@ -12,6 +12,8 @@ class SensorData {
     void setLux1(float lux);
     void setLux2(float lux);
     void setLux3(float lux);
+    
+    void setSensorsErrorState(bool state);
 
     // Getters
     float getTemperatureIndoor() const;
@@ -23,10 +25,14 @@ class SensorData {
     float getLux2() const;
     float getLux3() const;
 
+    bool getSensorsErrorState() const ;
+
+
   private:
     float temperatureIndoor, humidityIndoor;
     float temperatureOutdoor, humidityOutdoor;
     float lux1, lux2, lux3;
+    bool sensorsErrorState;
 };
 
 

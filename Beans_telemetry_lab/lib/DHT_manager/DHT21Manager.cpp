@@ -11,7 +11,7 @@ void DHT21Manager::begin() {
 float DHT21Manager::readTemperature() {
   float temp = dht.readTemperature();
   if (isnan(temp)) {
-    return -1000.0; // Error: temperatura no válida
+    return -1.0; // Error: temperatura no válida
   }
   return temp;
 }
