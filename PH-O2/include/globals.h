@@ -1,7 +1,9 @@
 #ifndef GLOBALS_H
 #define GLOBALS_H
 #include "WiFiPortalManager.h"
-// #include "LCD_manager.h"
+#include "LCD_manager.h"
+#include "ADS1115_manager.h"
+#include "DS18B20_manager.h"
 
 #define SW_DOWN 36
 #define SW_UP 39
@@ -21,10 +23,10 @@
 
 #define TELNET_HOSTNAME "ph-remote"
 
-// extern Lcd16x2 lcd;    // Declaración, no creación
-
-
+// Declaración, no creación
+extern Lcd16x2 lcd;    
 extern RemoteAccessManager remoteManager;
-
+extern ADS1115Manager ads;
+extern DS18B20Manager thermo;
 
 #endif
