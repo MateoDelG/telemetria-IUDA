@@ -12,7 +12,7 @@ TaskHandle_t TaskCore1;
 
 WiFiPortalManager wifiManager(TELNET_HOSTNAME, "12345678", SW_DOWN);
 
-PHManager ph(&ads, /*channel=*/0, /*avgSamples=*/24);
+PHManager ph(&ads, /*channel=*/0, /*avgSamples=*/6);
 ConfigStore eeprom;
 
 
