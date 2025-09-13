@@ -77,6 +77,14 @@ bool ADS1115Manager::readOnceRawDiff_(uint8_t pair, int16_t& raw) {
 bool ADS1115Manager::readSingleRaw(uint8_t channel, int16_t& raw) {
   if (!checkChannel_(channel)) return false;
 
+  // ---- Dummy read para asentamiento ----
+  int16_t throwaway;
+  if (!readOnceRawSingle_(channel, throwaway)) {
+    setError_("Lectura dummy falló");
+    return false;
+  }
+
+  // ---- Lecturas promediadas ----
   int32_t acc = 0;
   for (uint8_t i = 0; i < avg_; ++i) {
     int16_t r;
@@ -86,11 +94,13 @@ bool ADS1115Manager::readSingleRaw(uint8_t channel, int16_t& raw) {
     }
     acc += r;
   }
+
   last_raw_ = static_cast<int16_t>(acc / (int32_t)avg_);
   last_error_[0] = '\0';
   raw = last_raw_;
   return true;
 }
+
 
 bool ADS1115Manager::readSingle(uint8_t channel, float& volts) {
   int16_t raw;
