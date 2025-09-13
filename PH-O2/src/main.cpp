@@ -105,20 +105,20 @@ void initHardware() {
   pinMode(SW_UP, INPUT);
   pinMode(SW_OK, INPUT);
   pinMode(SW_ESC, INPUT);
-  pinMode(SENSOR_LEVEL_H2O, INPUT);
-  pinMode(SENSOR_LEVEL_KCL, INPUT);
+  // pinMode(SENSOR_LEVEL_H2O, INPUT);
+  // pinMode(SENSOR_LEVEL_KCL, INPUT);
   pinMode(BUZZER, OUTPUT);
-  pinMode(PUMP_1_PIN, OUTPUT);
-  pinMode(PUMP_2_PIN, OUTPUT);
-  pinMode(PUMP_3_PIN, OUTPUT);
-  pinMode(PUMP_4_PIN, OUTPUT);
-  pinMode(MIXER_PIN, OUTPUT);
+  // pinMode(PUMP_1_PIN, OUTPUT);
+  // pinMode(PUMP_2_PIN, OUTPUT);
+  // pinMode(PUMP_3_PIN, OUTPUT);
+  // pinMode(PUMP_4_PIN, OUTPUT);
+  // pinMode(MIXER_PIN, OUTPUT);
 
   digitalWrite(BUZZER, LOW);
-  digitalWrite(PUMP_1_PIN, LOW);
-  digitalWrite(PUMP_2_PIN, LOW);
-  digitalWrite(PUMP_3_PIN, LOW);
-  digitalWrite(PUMP_4_PIN, LOW);
+  // digitalWrite(PUMP_1_PIN, LOW);
+  // digitalWrite(PUMP_2_PIN, LOW);
+  // digitalWrite(PUMP_3_PIN, LOW);
+  // digitalWrite(PUMP_4_PIN, LOW);
   digitalWrite(MIXER_PIN, LOW);
 }
 
@@ -210,6 +210,8 @@ void initPumps(){
   //mixer = MIXER
   pumps.begin(PUMP_1_PIN, PUMP_2_PIN, PUMP_3_PIN, PUMP_4_PIN, MIXER_PIN, /*activeHigh(bombas)=*/true,
               /*mixerInverted=*/true);
+  pumps.beginLevels(SENSOR_LEVEL_H2O, SENSOR_LEVEL_KCL, /*usePullup=*/false);
+
   pumps.allOff();
 
 }
@@ -580,14 +582,15 @@ static bool ManualPumpsTick() {
     { "H2O",    PumpId::H2O    },
     { "SAMPLE", PumpId::SAMPLE },
     { "DRAIN",  PumpId::DRAIN  },
-    { "MIXER",  PumpId::MIXER  },
+    { "MIXER",  PumpId::MIXER  },  // <- usa PumpId::Mixer si renombraste
   };
   static const uint8_t N = sizeof(items) / sizeof(items[0]);
 
   // Estado local persistente
-  static uint8_t cursor = 0;
-  static int8_t  lastCursor = -1;
-  static bool    lastState  = false;
+  static uint8_t cursor      = 0;
+  static int8_t  lastCursor  = -1;
+  static bool    lastState   = false;
+  static bool    needFirstDraw = true;   // <-- fuerza render al entrar
 
   auto render = [&](bool force=false) {
     bool st = pumps.isOn(items[cursor].id);
@@ -601,9 +604,17 @@ static bool ManualPumpsTick() {
     }
   };
 
-  render(/*force=*/(lastCursor < 0));
+  // Si venimos de fuera, limpia y fuerza el primer pintado
+  if (needFirstDraw) {
+    lcd.clear();
+    needFirstDraw = false;
+    render(true);
+  } else {
+    // Si no hay cambios, asegura que al menos una vez dibujamos
+    if (lastCursor < 0) render(true);
+  }
 
-  // Botones latcheados (misma mecánica que usas en el menú principal)
+  // Botones latcheados (ya actualizados por el menú principal)
   if (Buttons::BTN_UP.value) {
     Buttons::BTN_UP.reset();
     cursor = (cursor == 0) ? (N - 1) : (cursor - 1);
@@ -631,6 +642,7 @@ static bool ManualPumpsTick() {
       return false;
     } else {
       // ya estaba apagada: salir al menú anterior
+      needFirstDraw = true;       // <-- prepara primer render para próxima entrada
       return true;
     }
   }
@@ -638,19 +650,76 @@ static bool ManualPumpsTick() {
   return false; // continuar en manual
 }
 
+// Muestra estado de sensores de nivel (H2O/KCL) y sale con ESC.
+// Devuelve true cuando se debe volver al menú anterior.
+static bool ManualLevelsTick() {
+  // estado persistente local
+  static bool needFirstDraw = true;
+  static int8_t lastH2O = -1;  // -1 = desconocido, 0 = LOW, 1 = HIGH
+  static int8_t lastKCL = -1;
+
+  auto readAndRender = [&](bool force=false) {
+    bool h2o = pumps.levelH2O();   // true si pin está HIGH (ajusta lógica según hardware)
+    bool kcl = pumps.levelKCL();
+
+    int8_t h2o_i = h2o ? 0 : 1;
+    int8_t kcl_i = kcl ? 0 : 1;
+
+    if (force || h2o_i != lastH2O || kcl_i != lastKCL) {
+      char l0[17], l1[17];
+      snprintf(l0, sizeof(l0), "Nivel H2O:%s", h2o ? "BAJO" : "OK");
+      snprintf(l1, sizeof(l1), "Nivel KCL:%s", kcl ? "BAJO" : "OK");
+      lcd.printAt(0,0, l0);
+      lcd.printAt(0,1, l1);
+      lastH2O = h2o_i;
+      lastKCL = kcl_i;
+    }
+  };
+
+  if (needFirstDraw) {
+    lcd.clear();
+    needFirstDraw = false;
+    readAndRender(true);
+  } else {
+    // refresco oportunista si cambia el estado
+    readAndRender(false);
+  }
+
+  // Controles: ESC = volver, OK = refrescar manual
+  if (Buttons::BTN_ESC.value) {
+    Buttons::BTN_ESC.reset();
+    needFirstDraw = true;   // fuerza redraw en próxima entrada
+    return true;            // salir a menú anterior
+  }
+  if (Buttons::BTN_OK.value) {
+    Buttons::BTN_OK.reset();
+    readAndRender(true);
+  }
+  if (Buttons::BTN_UP.value)   Buttons::BTN_UP.reset();   // sin acción
+  if (Buttons::BTN_DOWN.value) Buttons::BTN_DOWN.reset(); // sin acción
+
+  return false; // permanecer en esta pantalla
+}
+
 
 static void MenuDemoTick() {
   // --- prototipos externos que usa el menú ---
   extern ConfigStore eeprom;                               // EEPROM (ADC)
   extern bool runADSCalibration_0V_3p31V(uint8_t, uint8_t);// Calibración ADS
-  extern bool runPHCalibration_7_4(uint8_t samples);       // ← Calibración pH (ya implementada)
+  extern bool runPHCalibration_7_4(uint8_t samples);       // Calibración pH
   extern float readADC();                                  // lectura ADC (V)
   extern float readPH();                                   // lectura pH
   extern float readThermo();                               // lectura temperatura
+  extern bool ManualPumpsTick();
 
   // ----- Estado persistente (solo dentro de esta función) -----
   enum class View : uint8_t {
-    ROOT, MANUAL, AUTO, CONFIG, TEMP,
+    ROOT,
+    MANUAL_MENU,      // << nuevo: submenú Manual
+    MANUAL_PUMPS,     // << nuevo: pantalla Bombas (usa ManualPumpsTick)
+    MANUAL_LEVELS,    // << nuevo: pantalla Sensores de nivel
+    AUTO,
+    CONFIG, TEMP,
     CAL_ADS_MENU, CAL_ADS_READ, CAL_ADS_RUN,
     CAL_PH_MENU,  CAL_PH_READ,  CAL_PH_RUN
   };
@@ -661,6 +730,11 @@ static void MenuDemoTick() {
   static const char* rootItems[] = { "Manual", "Automatico", "Configuracion" };
   static const uint8_t ROOT_N = sizeof(rootItems)/sizeof(rootItems[0]);
   static uint8_t rootCursor = 0;
+
+  // --- Manual submenu ---
+  static const char* manualItems[] = { "Bombas", "Sensores Nivel" };
+  static const uint8_t MAN_N = sizeof(manualItems)/sizeof(manualItems[0]);
+  static uint8_t manualCursor = 0;
 
   // Config
   static const char* cfgItems[]  = { "pH", "O2", "Temperatura", "ADC" };
@@ -687,6 +761,11 @@ static void MenuDemoTick() {
   auto renderRoot = [&](){
     lcd.printAt(0,0, "Menu");
     String line = ">" + String(rootItems[rootCursor]);
+    lcd.printAt(0,1, line);
+  };
+  auto renderManualMenu = [&](){
+    lcd.printAt(0,0, "Manual");
+    String line = ">" + String(manualItems[manualCursor]);
     lcd.printAt(0,1, line);
   };
   auto renderSub = [&](const char* title){
@@ -758,7 +837,7 @@ static void MenuDemoTick() {
     return Btn::NONE;
   };
 
-  // ----- Si estamos en TEMP, refrescar lectura periódicamente -----
+  // --- refresco periódico solo para TEMP ---
   if (view == View::TEMP) {
     unsigned long now = millis();
     if (now - lastReadMs >= TEMP_READ_PERIOD) {
@@ -781,35 +860,63 @@ static void MenuDemoTick() {
           lcd.clear(); renderRoot(); break;
         case Btn::OK:
           lcd.clear();
-          if      (rootCursor==0) { view = View::MANUAL;}
-          else if (rootCursor==1) { view = View::AUTO;   renderSub("Automatico"); }
-          else                    { view = View::CONFIG; renderConfig(); }
+          if      (rootCursor==0) { view = View::MANUAL_MENU; renderManualMenu(); }
+          else if (rootCursor==1) { view = View::AUTO;        renderSub("Automatico"); }
+          else                    { view = View::CONFIG;      renderConfig(); }
           break;
         default: break;
       }
     } break;
 
-    case View::MANUAL: {
-      // Render inicial solo una vez
-      static bool first = true;
-      if (first) {
-        lcd.clear();
-        lcd.printAt(0,0, "Manual");
-        lcd.printAt(0,1, ">Bombas");
-        first = false;
+    // --------- Manual: Submenú (Bombas / Sensores Nivel) ----------
+    case View::MANUAL_MENU: {
+      switch (readLatched()) {
+        case Btn::UP:
+          manualCursor = (manualCursor==0) ? (MAN_N-1) : (manualCursor-1);
+          lcd.clear(); renderManualMenu(); break;
+        case Btn::DOWN:
+          manualCursor = (manualCursor+1) % MAN_N;
+          lcd.clear(); renderManualMenu(); break;
+        case Btn::OK:
+          lcd.clear();
+          if (manualCursor == 0) {
+            view = View::MANUAL_PUMPS;
+          } else {
+            // Entrar a Sensores Nivel
+            view = View::MANUAL_LEVELS;
+            // pintado inicial
+            lcd.printAt(0,0, "Sensores nivel");
+            lcd.printAt(0,1, "ESC: atras");
+          }
+          break;
+        case Btn::ESC:
+          view = View::ROOT; lcd.clear(); renderRoot(); break;
+        default: break;
       }
-
-      if (ManualPumpsTick()) {
-        // salir a la pantalla anterior
-        view = View::ROOT;   // o a donde corresponda en tu FSM
-        lcd.clear();
-        renderRoot();
-        first = true;        // reinicia la vista manual para la próxima vez
-      }
-
-      break;
     } break;
 
+    // --------- Manual: Bombas (usa ManualPumpsTick) ----------
+    case View::MANUAL_PUMPS: {
+      static bool first = true;
+      if (first) { lcd.clear(); first = false; }   // pantalla limpia al entrar
+      if (ManualPumpsTick()) {
+        view = View::MANUAL_MENU;
+        lcd.clear();
+        renderManualMenu();
+        first = true;                               // para que la próxima entrada limpie
+      }
+    }  break;
+
+    // --------- Manual: Sensores de nivel ----------
+    case View::MANUAL_LEVELS: {
+      if (ManualLevelsTick()) {
+        view = View::MANUAL_MENU;
+        lcd.clear();
+        renderManualMenu();
+      }
+    } break;
+
+    // --------- Automático ----------
     case View::AUTO: {
       static bool autoRunning = false;
       switch (readLatched()) {
@@ -823,6 +930,7 @@ static void MenuDemoTick() {
       }
     } break;
 
+    // --------- Configuración ----------
     case View::CONFIG: {
       switch (readLatched()) {
         case Btn::UP:
@@ -859,7 +967,7 @@ static void MenuDemoTick() {
             view = View::CAL_ADS_READ;
           } else {                         // Calibrar
             lcd.clear();
-            view = View::CAL_ADS_RUN;      // delega a la rutina interactiva
+            view = View::CAL_ADS_RUN;
           }
           break;
         case Btn::ESC:
@@ -871,7 +979,7 @@ static void MenuDemoTick() {
     // Pantalla de lectura ADC (OK refresca, ESC vuelve)
     case View::CAL_ADS_READ: {
       switch (readLatched()) {
-        case Btn::OK:  lcd.clear(); renderADSRead(); break;  // refrescar
+        case Btn::OK:  lcd.clear(); renderADSRead(); break;
         case Btn::ESC: view = View::CAL_ADS_MENU; lcd.clear(); renderADSMenu(); break;
         default: break;
       }
@@ -897,9 +1005,9 @@ static void MenuDemoTick() {
           if (phCursor == 0) {            // Leer pH
             lcd.clear(); renderPHRead();
             view = View::CAL_PH_READ;
-          } else {                         // Calibrar pH (7.00 y 4.00)
+          } else {                         // Calibrar pH
             lcd.clear();
-            view = View::CAL_PH_RUN;      // delega a la rutina interactiva
+            view = View::CAL_PH_RUN;
           }
           break;
         case Btn::ESC:
@@ -911,13 +1019,13 @@ static void MenuDemoTick() {
     // Pantalla de lectura pH (OK refresca, ESC vuelve)
     case View::CAL_PH_READ: {
       switch (readLatched()) {
-        case Btn::OK:  lcd.clear(); renderPHRead(); break;  // refrescar lectura
+        case Btn::OK:  lcd.clear(); renderPHRead(); break;
         case Btn::ESC: view = View::CAL_PH_MENU; lcd.clear(); renderPHMenu(); break;
         default: break;
       }
     } break;
 
-    // Rutina de calibración pH (usa runPHCalibration_7_4)
+    // Rutina de calibración pH
     case View::CAL_PH_RUN: {
       if (runPHCalibration_7_4(/*samples=*/5)) {
         view = View::CAL_PH_MENU; lcd.clear(); renderPHMenu();
