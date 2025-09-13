@@ -4,6 +4,7 @@
 #include "pH_manager.h"
 #include "menu_manager.h"
 #include "eeprom_manager.h"
+#include "pumps_manager.h"
 #include <globals.h>
 
 TaskHandle_t TaskCore0;
@@ -12,6 +13,7 @@ TaskHandle_t TaskCore1;
 
 WiFiPortalManager wifiManager(TELNET_HOSTNAME, "12345678", SW_DOWN);
 
+PumpsManager pumps;
 PHManager ph(&ads, /*channel=*/0, /*avgSamples=*/6);
 ConfigStore eeprom;
 
@@ -25,6 +27,7 @@ void initLCD();
 void initADC();
 void initPH();
 void initEEPROM();
+void initPumps();
 float readThermo();
 float readADC();
 float readPH();
@@ -35,6 +38,7 @@ static void MenuDemoTick();
 void setup() {
   Serial.begin(115200);
   initHardware();
+  initPumps();
   initDualCore();
   initEEPROM();
   initWiFi();
@@ -59,6 +63,7 @@ void taskCore0(void *pvParameters) {
     // delay(1000);
     // delay(100);
     MenuDemoTick();
+
     vTaskDelay(200 / portTICK_PERIOD_MS); // Espera 100 ms
   }
 }
@@ -103,18 +108,18 @@ void initHardware() {
   pinMode(SENSOR_LEVEL_H2O, INPUT);
   pinMode(SENSOR_LEVEL_KCL, INPUT);
   pinMode(BUZZER, OUTPUT);
-  pinMode(PUMP_1, OUTPUT);
-  pinMode(PUMP_2, OUTPUT);
-  pinMode(PUMP_3, OUTPUT);
-  pinMode(PUMP_4, OUTPUT);
-  pinMode(MIXER, OUTPUT);
+  pinMode(PUMP_1_PIN, OUTPUT);
+  pinMode(PUMP_2_PIN, OUTPUT);
+  pinMode(PUMP_3_PIN, OUTPUT);
+  pinMode(PUMP_4_PIN, OUTPUT);
+  pinMode(MIXER_PIN, OUTPUT);
 
   digitalWrite(BUZZER, LOW);
-  digitalWrite(PUMP_1, LOW);
-  digitalWrite(PUMP_2, LOW);
-  digitalWrite(PUMP_3, LOW);
-  digitalWrite(PUMP_4, LOW);
-  digitalWrite(MIXER, LOW);
+  digitalWrite(PUMP_1_PIN, LOW);
+  digitalWrite(PUMP_2_PIN, LOW);
+  digitalWrite(PUMP_3_PIN, LOW);
+  digitalWrite(PUMP_4_PIN, LOW);
+  digitalWrite(MIXER_PIN, LOW);
 }
 
 void initWiFi() {
@@ -197,6 +202,18 @@ void initEEPROM(){
   // ads.setCalibration(m,b);
 }
 
+void initPumps(){
+  //pump1 = KCL
+  //pump2 = H2O
+  //pump3 = SAMPLE
+  //pump4 = DRAIN
+  //mixer = MIXER
+  pumps.begin(PUMP_1_PIN, PUMP_2_PIN, PUMP_3_PIN, PUMP_4_PIN, MIXER_PIN, /*activeHigh(bombas)=*/true,
+              /*mixerInverted=*/true);
+  pumps.allOff();
+
+}
+
 float readADC() {
   // Lee A0..A3 single-ended
   // for (uint8_t ch = 0; ch < 4; ch++) {
@@ -237,221 +254,6 @@ float readThermo(){
   // delay(1000);
 }
 
-// Lee pH hasta que 3 medidas consecutivas queden dentro de un rango de 0.5 pH.
-// Si la ventana de 3 es inestable, la “rearma” con el promedio de las tres
-// anteriores siguiendo el patrón solicitado:
-//   [a,b,c] -> avg0=(a+b+c)/3
-//   1ª inestabilidad: [avg0, avg0, nueva]
-//   2ª inestabilidad: [avg_prev, avg0, nueva]
-// Devuelve el promedio de las 3 lecturas estables, o el último válido si no se logra.
-// float readPH() {
-//   const float    THRESH_PH       = 0.5f;    // rango máx entre 3 lecturas
-//   const uint8_t  NEED            = 3;       // tamaño de ventana
-//   const uint8_t  MAX_TRIES       = 12;      // límite de intentos
-//   const uint16_t SAMPLE_DELAY_MS = 50;    // espera entre lecturas
-
-//   float phBuf[NEED] = { NAN, NAN, NAN };
-//   float vBuf [NEED] = { NAN, NAN, NAN };
-//   uint8_t have = 0;
-
-//   float lastValidPh = NAN, lastValidV = NAN;
-//   float lastAvg = NAN;  // guarda el último promedio usado para rearmar ventana
-//   char  lastErr[64] = {0};
-
-//   for (uint8_t i = 0; i < MAX_TRIES; ++i) {
-//     // Temperatura con fallback
-//     float tC = readThermo();
-//     bool  tOk = (!isnan(tC) && tC != -1.0f && tC > -40.0f && tC < 125.0f);
-//     float tUsed = tOk ? tC : 25.0f;
-
-//     // Lectura pH + volts
-//     float phValue = NAN, volts = NAN;
-//     if (!ph.readPH(tUsed, phValue, &volts)) {
-//       strncpy(lastErr, ph.lastError(), sizeof(lastErr)-1);
-//       delay(SAMPLE_DELAY_MS);
-//       continue;
-//     }
-
-//     lastValidPh = phValue;
-//     lastValidV  = volts;
-
-//     // Ventana deslizante (si estamos rearmando, 'have' puede ser 2)
-//     if (have < NEED) {
-//       phBuf[have] = phValue;
-//       vBuf [have] = volts;
-//       have++;
-//     } else {
-//       phBuf[0] = phBuf[1];
-//       phBuf[1] = phBuf[2];
-//       phBuf[2] = phValue;
-
-//       vBuf[0]  = vBuf[1];
-//       vBuf[1]  = vBuf[2];
-//       vBuf[2]  = volts;
-//     }
-
-//     if (have == NEED) {
-//       // Evalúa estabilidad
-//       float minPh = phBuf[0], maxPh = phBuf[0];
-//       for (uint8_t k = 1; k < NEED; ++k) {
-//         if (phBuf[k] < minPh) minPh = phBuf[k];
-//         if (phBuf[k] > maxPh) maxPh = phBuf[k];
-//       }
-//       float span = maxPh - minPh;
-
-//       if (span <= THRESH_PH) {
-//         float phStable = (phBuf[0] + phBuf[1] + phBuf[2]) / 3.0f;
-//         float vStable  = (vBuf [0] + vBuf [1] + vBuf [2]) / 3.0f;
-//         remoteManager.log("pH = " + String(phStable, 3) +
-//                           "   V = " + String(vStable, 4) +
-//                           "   (estable x3, span=" + String(span, 2) + ")");
-//         return phStable;
-//       } else {
-//         // Inestable: rearmar ventana con promedio de las 3 previas
-//         float avgPh = (phBuf[0] + phBuf[1] + phBuf[2]) / 3.0f;
-//         float avgV  = (vBuf [0] + vBuf [1] + vBuf [2]) / 3.0f;
-
-//         // Patrón:
-//         // - Si no hay promedio anterior, usar avg actual dos veces: [avg, avg, nueva]
-//         // - Si ya hubo un promedio anterior, usar [lastAvg, avg, nueva]
-//         if (isnan(lastAvg)) {
-//           phBuf[0] = avgPh;
-//           phBuf[1] = avgPh;
-//           vBuf [0] = avgV;
-//           vBuf [1] = avgV;
-//         } else {
-//           phBuf[0] = lastAvg;
-//           phBuf[1] = avgPh;
-//           vBuf [0] = lastAvg;  // aproximación: no tenemos V_avg_prev separado
-//           vBuf [1] = avgV;
-//         }
-//         // Dejar espacio para la próxima “nueva” muestra
-//         have = 2;
-//         lastAvg = avgPh;
-
-//         remoteManager.log("pH inestable(3) span=" + String(span,2) +
-//                           " -> ventana=[ " + String(phBuf[0],2) + ", " +
-//                                            String(phBuf[1],2) + ", nueva ]");
-//       }
-//     }
-
-//     delay(SAMPLE_DELAY_MS);
-//   }
-
-//   if (!isnan(lastValidPh)) {
-//     remoteManager.log("pH sin estabilidad x3, devuelvo ultimo = " +
-//                       String(lastValidPh, 3) + " (V=" + String(lastValidV, 4) + ")");
-//     return lastValidPh;
-//   }
-
-//   remoteManager.log(String("pH ERR: ") + (lastErr[0] ? lastErr : "sin lectura valida"));
-//   return -99.0f;
-// }
-
-// // Promedio móvil de 3 muestras (estado interno persistente por llamada).
-// static float ma3_update(float x, bool reset = false) {
-//   static float buf[3] = {NAN, NAN, NAN};
-//   static uint8_t i = 0, n = 0;
-//   static float sum = 0.0f;
-
-//   if (reset) { i = n = 0; sum = 0; buf[0] = buf[1] = buf[2] = NAN; return NAN; }
-
-//   if (n < 3) {                // llenando
-//     buf[i] = x; sum += x; i = (i + 1) % 3; n++;
-//     return sum / n;
-//   } else {                    // ventana llena
-//     sum -= buf[i];
-//     buf[i] = x;
-//     sum += x;
-//     i = (i + 1) % 3;
-//     return sum / 3.0f;
-//   }
-// }
-
-// Cada llamada empieza con un MA(3) limpio.
-// Lee hasta que la diferencia entre dos MA3 consecutivos sea < 0.5 pH.
-// Devuelve el MA3 estable; si no se logra, devuelve el último MA3 “full” válido,
-// o -99 si nunca hubo lectura válida.
-// float readPH() {
-//   const float    THRESH_PH         = 0.5f;   // criterio de estabilidad
-//   const uint8_t  MAX_TRIES         = 15;     // evita bucles infinitos
-//   const uint16_t SAMPLE_DELAY_MS   = 1;   // espera entre lecturas
-
-//   // ---- Promedio móvil de 3 (estado local → se “resetea” en cada llamada) ----
-//   float buf[3] = {NAN, NAN, NAN};
-//   float sum = 0.0f;
-//   uint8_t n = 0, idx = 0;
-//   auto ma3_push = [&](float x, float& ma_out, bool& full_out) {
-//     if (n < 3) {
-//       buf[idx] = x; sum += x; idx = (idx + 1) % 3; n++;
-//       ma_out = sum / n; full_out = (n == 3);
-//     } else {
-//       sum -= buf[idx];
-//       buf[idx] = x;
-//       sum += x;
-//       idx = (idx + 1) % 3;
-//       ma_out = sum / 3.0f; full_out = true;
-//     }
-//   };
-
-//   float lastMA = NAN;       // último MA3 “full” (para comparar Δ)
-//   float lastValidMA = NAN;  // por si no se alcanza estabilidad
-//   char  lastErr[64] = {0};
-
-//   for (uint8_t t = 0; t < MAX_TRIES; ++t) {
-//     // Temperatura con fallback a 25 °C si inválida
-//     float tC = readThermo();
-//     bool  tOk = (!isnan(tC) && tC != -1.0f && tC > -40.0f && tC < 125.0f);
-//     float tUsed = tOk ? tC : 25.0f;
-
-//     // Lectura cruda
-//     float phValue = NAN, volts = NAN;
-//     if (!ph.readPH(tUsed, phValue, &volts)) {
-//       strncpy(lastErr, ph.lastError(), sizeof(lastErr)-1);
-//       delay(SAMPLE_DELAY_MS);
-//       continue;
-//     }
-
-//     // Actualiza MA3
-//     float ma = NAN; bool full = false;
-//     ma3_push(phValue, ma, full);
-
-//     // Log
-//     remoteManager.log("pH=" + String(phValue, 3) +
-//                       "  MA3=" + String(ma, 3) +
-//                       "  V=" + String(volts, 4) +
-//                       "  T=" + String(tUsed, 1) +
-//                       (full ? " [full]" : " [fill]"));
-
-//     // Condición de estabilidad: dos MA3 “full” consecutivos cercanos
-//     if (full) {
-//       if (!isnan(lastMA)) {
-//         float diff = fabsf(ma - lastMA);
-//         if (diff < THRESH_PH) {
-//           remoteManager.log("MA3 estable: " + String(ma, 3) +
-//                             " (Δ=" + String(diff, 2) + ")");
-//           return ma;
-//         } else {
-//           remoteManager.log("MA3 inestable: Δ=" + String(diff, 2));
-//         }
-//       }
-//       lastMA = ma;
-//       lastValidMA = ma;
-//     }
-
-//     delay(SAMPLE_DELAY_MS);
-//   }
-
-//   if (!isnan(lastValidMA)) {
-//     remoteManager.log("pH sin estabilidad (<" + String(THRESH_PH,1) +
-//                       "), devuelvo ultimo MA3=" + String(lastValidMA,3));
-//     return lastValidMA;
-//   }
-
-//   remoteManager.log(String("pH ERR: ") + (lastErr[0] ? lastErr : "sin lectura valida"));
-//   return -99.0f;
-// }
-
 float readPH() {
   float tC = readThermo();   // compensa por temperatura si tu 'ph.readPH' lo hace
   float phValue = NAN, volts = NAN;
@@ -464,10 +266,6 @@ float readPH() {
     return -99.0f;
   }
 }
-
-
-
-
 
 void APIUI() {
   Buttons::testButtons();
@@ -770,6 +568,77 @@ static bool runPHCalibration_7_4(uint8_t samples = 64) {
   }
 }
 
+// Selector manual de actuadores (KCL, H2O, SAMPLE, DRAIN, MIXER).
+// Controles: UP/DOWN para seleccionar; OK = encender; ESC = apagar.
+// No usa extern aquí: asume que `lcd`, `pumps` y `Buttons::BTN_*` existen globalmente.
+// Llama esta función cuando estés en la vista "MANUAL" dentro de tu FSM.
+// Devuelve true cuando el usuario quiere salir (ESC con bomba ya apagada)
+static bool ManualPumpsTick() {
+  struct Item { const char* name; PumpId id; };
+  static const Item items[] = {
+    { "KCL",    PumpId::KCL    },
+    { "H2O",    PumpId::H2O    },
+    { "SAMPLE", PumpId::SAMPLE },
+    { "DRAIN",  PumpId::DRAIN  },
+    { "MIXER",  PumpId::MIXER  },
+  };
+  static const uint8_t N = sizeof(items) / sizeof(items[0]);
+
+  // Estado local persistente
+  static uint8_t cursor = 0;
+  static int8_t  lastCursor = -1;
+  static bool    lastState  = false;
+
+  auto render = [&](bool force=false) {
+    bool st = pumps.isOn(items[cursor].id);
+    if (force || (int8_t)cursor != lastCursor || st != lastState) {
+      char l0[17];
+      snprintf(l0, sizeof(l0), "%-10s %s", items[cursor].name, st ? "ON " : "OFF");
+      lcd.printAt(0,0, l0);
+      lcd.printAt(0,1, "OK:on ESC:off");
+      lastCursor = (int8_t)cursor;
+      lastState  = st;
+    }
+  };
+
+  render(/*force=*/(lastCursor < 0));
+
+  // Botones latcheados (misma mecánica que usas en el menú principal)
+  if (Buttons::BTN_UP.value) {
+    Buttons::BTN_UP.reset();
+    cursor = (cursor == 0) ? (N - 1) : (cursor - 1);
+    render(true);
+    return false;
+  }
+  if (Buttons::BTN_DOWN.value) {
+    Buttons::BTN_DOWN.reset();
+    cursor = (cursor + 1) % N;
+    render(true);
+    return false;
+  }
+  if (Buttons::BTN_OK.value) {
+    Buttons::BTN_OK.reset();
+    pumps.on(items[cursor].id);   // encender
+    render(true);
+    return false;
+  }
+  if (Buttons::BTN_ESC.value) {
+    Buttons::BTN_ESC.reset();
+    // si está ON -> apaga y permanece; si ya está OFF -> salir
+    if (pumps.isOn(items[cursor].id)) {
+      pumps.off(items[cursor].id);
+      render(true);
+      return false;
+    } else {
+      // ya estaba apagada: salir al menú anterior
+      return true;
+    }
+  }
+
+  return false; // continuar en manual
+}
+
+
 static void MenuDemoTick() {
   // --- prototipos externos que usa el menú ---
   extern ConfigStore eeprom;                               // EEPROM (ADC)
@@ -912,7 +781,7 @@ static void MenuDemoTick() {
           lcd.clear(); renderRoot(); break;
         case Btn::OK:
           lcd.clear();
-          if      (rootCursor==0) { view = View::MANUAL; renderSub("Manual"); }
+          if      (rootCursor==0) { view = View::MANUAL;}
           else if (rootCursor==1) { view = View::AUTO;   renderSub("Automatico"); }
           else                    { view = View::CONFIG; renderConfig(); }
           break;
@@ -921,15 +790,24 @@ static void MenuDemoTick() {
     } break;
 
     case View::MANUAL: {
-      switch (readLatched()) {
-        case Btn::OK:
-          lcd.splash("Manual","Medicion...", 600);
-          renderSub("Manual");
-          break;
-        case Btn::ESC:
-          view = View::ROOT; lcd.clear(); renderRoot(); break;
-        default: break;
+      // Render inicial solo una vez
+      static bool first = true;
+      if (first) {
+        lcd.clear();
+        lcd.printAt(0,0, "Manual");
+        lcd.printAt(0,1, ">Bombas");
+        first = false;
       }
+
+      if (ManualPumpsTick()) {
+        // salir a la pantalla anterior
+        view = View::ROOT;   // o a donde corresponda en tu FSM
+        lcd.clear();
+        renderRoot();
+        first = true;        // reinicia la vista manual para la próxima vez
+      }
+
+      break;
     } break;
 
     case View::AUTO: {

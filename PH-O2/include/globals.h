@@ -13,11 +13,11 @@
 #define SENSOR_LEVEL_KCL 32
 
 #define BUZZER 5
-#define PUMP_1 13
-#define PUMP_2 12
-#define PUMP_3 14 
-#define PUMP_4 27
-#define MIXER 26
+#define PUMP_1_PIN 13
+#define PUMP_2_PIN 12
+#define PUMP_3_PIN 14 
+#define PUMP_4_PIN 27
+#define MIXER_PIN 26
 
 #define TEMP_SENSOR 19
 
