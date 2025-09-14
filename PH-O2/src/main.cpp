@@ -570,6 +570,301 @@ static bool runPHCalibration_7_4(uint8_t samples = 64) {
   }
 }
 
+// ============================
+//  BOMBEOS: Configurar tiempo
+//  Flujo: elegir bomba -> OK inicia -> ESC detiene y guarda
+//  Devuelve true cuando finaliza (o cancela) para volver al menú anterior.
+// ============================
+static bool PumpTimesSetWizard() {
+  extern PumpsManager pumps;
+  extern ConfigStore  eeprom;
+
+  struct Item { const char* name; PumpId id; };
+  static const Item items[] = {
+    { "KCL",    PumpId::KCL    },
+    { "H2O",    PumpId::H2O    },
+    { "SAMPLE", PumpId::SAMPLE },
+  };
+  static const uint8_t N = sizeof(items)/sizeof(items[0]);
+
+  enum class Step : uint8_t { SELECT, SHOW, RUNNING, DONE };
+  static Step step = Step::SELECT;
+
+  static uint8_t  cursor        = 0;
+  static int8_t   lastCursor    = -1;
+  static bool     needFirstDraw = true;
+  static unsigned long tStart   = 0;
+  static PumpId   selId         = PumpId::KCL;
+
+  auto clearLatches = [](){
+    if (Buttons::BTN_OK.value)   Buttons::BTN_OK.reset();
+    if (Buttons::BTN_ESC.value)  Buttons::BTN_ESC.reset();
+    if (Buttons::BTN_UP.value)   Buttons::BTN_UP.reset();
+    if (Buttons::BTN_DOWN.value) Buttons::BTN_DOWN.reset();
+  };
+
+  auto storeTimeMs = [&](PumpId id, uint32_t ms){
+    switch (id) {
+      case PumpId::KCL:    eeprom.setKclFillMs(ms);    break;
+      case PumpId::H2O:    eeprom.setH2oFillMs(ms);    break;
+      case PumpId::SAMPLE: eeprom.setSampleFillMs(ms); break;
+      default: break;
+    }
+    eeprom.save();
+  };
+
+  auto renderSelect = [&](bool force=false){
+    if (force || (int8_t)cursor != lastCursor) {
+      char l0[17], l1[17];
+      snprintf(l0, sizeof(l0), "Set bombeo");
+      snprintf(l1, sizeof(l1), ">%-6s OK>", items[cursor].name);
+      lcd.printAt(0,0, l0);
+      lcd.printAt(0,1, l1);
+      lastCursor = (int8_t)cursor;
+    }
+  };
+
+  // Pantalla “BOMBEO” antes de iniciar (t=0, espera confirmación)
+  auto renderShowWaiting = [&](){
+    char l0[17], l1[17];
+    snprintf(l0, sizeof(l0), "%-6s BOMBEO", items[cursor].name);
+    snprintf(l1, sizeof(l1), "t=0s  OK:start");
+    lcd.printAt(0,0, l0);
+    lcd.printAt(0,1, l1);
+  };
+
+  // Pantalla corriendo (bomba encendida)
+  auto renderRunning = [&](){
+    unsigned long secs = (millis() - tStart) / 1000UL;
+    char l0[17], l1[17];
+    snprintf(l0, sizeof(l0), "%-6s BOMBEO", items[cursor].name);
+    snprintf(l1, sizeof(l1), "t=%lus ESC:stop", (unsigned long)secs);
+    lcd.printAt(0,0, l0);
+    lcd.printAt(0,1, l1);
+  };
+
+  if (needFirstDraw) {
+    lcd.clear();
+    needFirstDraw = false;
+    lastCursor    = -1;
+    step          = Step::SELECT;
+    tStart        = 0;
+    clearLatches();             // evita que un OK previo dispare nada
+    renderSelect(true);
+  }
+
+  switch (step) {
+    case Step::SELECT: {
+      if (Buttons::BTN_UP.value)   { Buttons::BTN_UP.reset();   cursor = (cursor==0)? (N-1) : (cursor-1); renderSelect(true); return false; }
+      if (Buttons::BTN_DOWN.value) { Buttons::BTN_DOWN.reset(); cursor = (cursor+1) % N;                   renderSelect(true); return false; }
+
+      if (Buttons::BTN_OK.value) {
+        Buttons::BTN_OK.reset();
+        selId  = items[cursor].id;
+        tStart = 0;                    // aún no inicia cronómetro
+        lcd.clear();
+        renderShowWaiting();           // << muestra “BOMBEO” y t=0s, espera OK
+        clearLatches();                // descarta el OK que nos trajo aquí
+        step = Step::SHOW;
+        return false;
+      }
+
+      if (Buttons::BTN_ESC.value) {
+        Buttons::BTN_ESC.reset();
+        needFirstDraw = true;
+        return true;                   // salir al menú anterior
+      }
+      return false;
+    }
+
+    case Step::SHOW: {
+      // Aún no corre: muestra t=0 y espera confirmación OK
+      if (Buttons::BTN_OK.value) {
+        Buttons::BTN_OK.reset();
+        tStart = millis();
+        pumps.on(selId);
+        lcd.clear();
+        renderRunning();
+        step = Step::RUNNING;
+        return false;
+      }
+      if (Buttons::BTN_ESC.value) {
+        Buttons::BTN_ESC.reset();
+        // salir sin iniciar
+        needFirstDraw = true;
+        step = Step::SELECT;
+        return true;
+      }
+      // re-dibujo eventual
+      renderShowWaiting();
+      return false;
+    }
+
+    case Step::RUNNING: {
+      renderRunning();
+
+      if (Buttons::BTN_ESC.value) {
+        Buttons::BTN_ESC.reset();
+        pumps.off(selId);
+        uint32_t ms = (uint32_t)(millis() - tStart);
+        storeTimeMs(selId, ms);
+
+        char l1[17]; snprintf(l1, sizeof(l1), "Guardado %lus", (unsigned long)(ms/1000));
+        lcd.splash("Tiempo bombeo", l1, 900);
+        step = Step::DONE;
+        return false;
+      }
+      return false;
+    }
+
+    case Step::DONE:
+    default: {
+      needFirstDraw = true;
+      step = Step::SELECT;
+      return true;
+    }
+  }
+}
+
+// ============================
+//  BOMBEOS: Probar tiempo guardado
+//  Flujo: elegir bomba -> OK ejecuta por tiempo guardado (auto OFF)
+//         ESC cancela/para y vuelve.
+//  Devuelve true cuando finaliza para volver al menú anterior.
+// ============================
+static bool PumpTimesTestWizard() {
+  extern PumpsManager pumps;
+  extern ConfigStore  eeprom;
+
+  auto getTimeMs = [&](PumpId id) -> uint32_t {
+    switch (id) {
+      case PumpId::KCL:    return eeprom.kclFillMs();
+      case PumpId::H2O:    return eeprom.h2oFillMs();
+      case PumpId::SAMPLE: return eeprom.sampleFillMs();
+      default:             return 0;
+    }
+  };
+
+  struct Item { const char* name; PumpId id; };
+  static const Item items[] = {
+    { "KCL",    PumpId::KCL    },
+    { "H2O",    PumpId::H2O    },
+    { "SAMPLE", PumpId::SAMPLE },
+  };
+  static const uint8_t N = sizeof(items)/sizeof(items[0]);
+
+  enum class Step : uint8_t { SELECT, RUNNING, DONE };
+  static Step step = Step::SELECT;
+
+  static uint8_t  cursor        = 0;
+  static int8_t   lastCursor    = -1;
+  static bool     needFirstDraw = true;
+  static bool     armed         = false;   // <<< NUEVO: requiere confirmación de OK
+  static unsigned long tEnd     = 0;
+  static PumpId   selId         = PumpId::KCL;
+  static uint32_t runMs         = 0;
+
+  auto clearLatches = [](){
+    if (Buttons::BTN_OK.value)   Buttons::BTN_OK.reset();
+    if (Buttons::BTN_ESC.value)  Buttons::BTN_ESC.reset();
+    if (Buttons::BTN_UP.value)   Buttons::BTN_UP.reset();
+    if (Buttons::BTN_DOWN.value) Buttons::BTN_DOWN.reset();
+  };
+
+  auto renderSelect = [&](bool force=false) {
+    if (force || (int8_t)cursor != lastCursor) {
+      uint32_t ms = getTimeMs(items[cursor].id);
+      char l0[17]; snprintf(l0, sizeof(l0), "Probar bombeo");
+      char l1[17]; snprintf(l1, sizeof(l1), ">%-6s %lus", items[cursor].name, (unsigned long)(ms/1000));
+      lcd.printAt(0,0, l0);
+      lcd.printAt(0,1, l1);
+      lastCursor = (int8_t)cursor;
+    }
+  };
+
+  auto renderRunning = [&](){
+    long rem = (long)(tEnd - millis());
+    if (rem < 0) rem = 0;
+    char l0[17]; snprintf(l0, sizeof(l0), "%-6s TEST", items[cursor].name);
+    char l1[17]; snprintf(l1, sizeof(l1), "rem=%lus ESC:stop", (unsigned long)(rem/1000));
+    lcd.printAt(0,0, l0);
+    lcd.printAt(0,1, l1);
+  };
+
+  if (needFirstDraw) {
+    lcd.clear();
+    needFirstDraw = false;
+    lastCursor    = -1;
+    step          = Step::SELECT;
+    armed         = false;     // <<< desarmado al entrar
+    renderSelect(true);
+  }
+
+  switch (step) {
+    case Step::SELECT: {
+      // Primera pasada: limpia latches y arma la pantalla; NO inicia nada.
+      if (!armed) {
+        clearLatches();    // <<< ignora el OK que te trajo aquí o un long-press
+        armed = true;
+        return false;
+      }
+
+      if (Buttons::BTN_UP.value)   { Buttons::BTN_UP.reset();   cursor = (cursor==0)? (N-1) : (cursor-1); renderSelect(true); }
+      if (Buttons::BTN_DOWN.value) { Buttons::BTN_DOWN.reset(); cursor = (cursor+1) % N;                   renderSelect(true); }
+
+      if (Buttons::BTN_OK.value) {
+        Buttons::BTN_OK.reset();
+        selId = items[cursor].id;
+        runMs = getTimeMs(selId);
+        if (runMs == 0) {
+          lcd.splash("Tiempo=0", "Configuralo", 800);
+          return false;
+        }
+        pumps.on(selId);
+        tEnd = millis() + runMs;
+        lcd.clear();
+        renderRunning();
+        step = Step::RUNNING;
+        return false;
+      }
+
+      if (Buttons::BTN_ESC.value) {
+        Buttons::BTN_ESC.reset();
+        needFirstDraw = true;
+        return true;
+      }
+      return false;
+    }
+
+    case Step::RUNNING: {
+      if (Buttons::BTN_ESC.value) {
+        Buttons::BTN_ESC.reset();
+        pumps.off(selId);
+        lcd.splash("Prueba cancel", "", 600);
+        step = Step::DONE;
+        return false;
+      }
+
+      if ((long)(millis() - tEnd) >= 0) {
+        pumps.off(selId);
+        lcd.splash("Prueba OK", "", 600);
+        step = Step::DONE;
+        return false;
+      }
+
+      renderRunning();
+      return false;
+    }
+
+    case Step::DONE:
+    default: {
+      needFirstDraw = true;
+      step = Step::SELECT;
+      return true;
+    }
+  }
+}
+
 // Selector manual de actuadores (KCL, H2O, SAMPLE, DRAIN, MIXER).
 // Controles: UP/DOWN para seleccionar; OK = encender; ESC = apagar.
 // No usa extern aquí: asume que `lcd`, `pumps` y `Buttons::BTN_*` existen globalmente.
@@ -704,24 +999,30 @@ static bool ManualLevelsTick() {
 
 static void MenuDemoTick() {
   // --- prototipos externos que usa el menú ---
-  extern ConfigStore eeprom;                               // EEPROM (ADC)
+  extern ConfigStore eeprom;                               // EEPROM (ADC + tiempos)
   extern bool runADSCalibration_0V_3p31V(uint8_t, uint8_t);// Calibración ADS
   extern bool runPHCalibration_7_4(uint8_t samples);       // Calibración pH
   extern float readADC();                                  // lectura ADC (V)
   extern float readPH();                                   // lectura pH
   extern float readThermo();                               // lectura temperatura
-  extern bool ManualPumpsTick();
+
+  // Subpantallas externas
+  extern bool ManualPumpsTick();       // control manual de bombas
+  extern bool ManualLevelsTick();      // lectura sensores de nivel
+  extern bool PumpTimesSetWizard();    // configurar tiempos de bombeo
+  extern bool PumpTimesTestWizard();   // probar tiempos de bombeo guardados
 
   // ----- Estado persistente (solo dentro de esta función) -----
   enum class View : uint8_t {
     ROOT,
-    MANUAL_MENU,      // << nuevo: submenú Manual
-    MANUAL_PUMPS,     // << nuevo: pantalla Bombas (usa ManualPumpsTick)
-    MANUAL_LEVELS,    // << nuevo: pantalla Sensores de nivel
+    MANUAL_MENU,      // Submenú Manual
+    MANUAL_PUMPS,     // Bombas (usa ManualPumpsTick)
+    MANUAL_LEVELS,    // Sensores de nivel (usa ManualLevelsTick)
     AUTO,
     CONFIG, TEMP,
     CAL_ADS_MENU, CAL_ADS_READ, CAL_ADS_RUN,
-    CAL_PH_MENU,  CAL_PH_READ,  CAL_PH_RUN
+    CAL_PH_MENU,  CAL_PH_READ,  CAL_PH_RUN,
+    CFG_PUMP_TIMES_MENU, CFG_PUMP_TIMES_SET, CFG_PUMP_TIMES_TEST
   };
   static bool     init = false;
   static View     view = View::ROOT;
@@ -737,7 +1038,7 @@ static void MenuDemoTick() {
   static uint8_t manualCursor = 0;
 
   // Config
-  static const char* cfgItems[]  = { "pH", "O2", "Temperatura", "ADC" };
+  static const char* cfgItems[]  = { "pH", "O2", "Temperatura", "ADC", "Tiempos bombeo" };
   static const uint8_t CFG_N = sizeof(cfgItems)/sizeof(cfgItems[0]);
   static uint8_t cfgCursor = 0;
 
@@ -750,6 +1051,11 @@ static void MenuDemoTick() {
   static const char* phItems[]   = { "Leer pH", "Calibrar pH" };
   static const uint8_t PH_N = sizeof(phItems)/sizeof(phItems[0]);
   static uint8_t phCursor = 0;
+
+  // Submenú Tiempos bombeo
+  static const char* pumpTimeItems[] = { "Configurar", "Probar" };
+  static const uint8_t PT_N = sizeof(pumpTimeItems)/sizeof(pumpTimeItems[0]);
+  static uint8_t ptCursor = 0;
 
   // Temperatura
   static int8_t  tempOffset = 0;
@@ -793,6 +1099,11 @@ static void MenuDemoTick() {
   auto renderPHMenu = [&](){
     lcd.printAt(0,0, "Calibrar pH");
     String line = ">" + String(phItems[phCursor]);
+    lcd.printAt(0,1, line);
+  };
+  auto renderPumpTimesMenu = [&](){
+    lcd.printAt(0,0, "Tiempos bombeo");
+    String line = ">" + String(pumpTimeItems[ptCursor]);
     lcd.printAt(0,1, line);
   };
 
@@ -882,11 +1193,7 @@ static void MenuDemoTick() {
           if (manualCursor == 0) {
             view = View::MANUAL_PUMPS;
           } else {
-            // Entrar a Sensores Nivel
             view = View::MANUAL_LEVELS;
-            // pintado inicial
-            lcd.printAt(0,0, "Sensores nivel");
-            lcd.printAt(0,1, "ESC: atras");
           }
           break;
         case Btn::ESC:
@@ -903,7 +1210,7 @@ static void MenuDemoTick() {
         view = View::MANUAL_MENU;
         lcd.clear();
         renderManualMenu();
-        first = true;                               // para que la próxima entrada limpie
+        first = true;                               // limpiar en próxima entrada
       }
     }  break;
 
@@ -944,7 +1251,12 @@ static void MenuDemoTick() {
           if      (cfgCursor==0) { view = View::CAL_PH_MENU;  renderPHMenu(); }
           else if (cfgCursor==1) { lcd.splash("Calibrar O2","Pendiente", 700); renderConfig(); }
           else if (cfgCursor==2) { view = View::TEMP;         renderTemp(); }
-          else                   { view = View::CAL_ADS_MENU; renderADSMenu(); }
+          else if (cfgCursor==3) { view = View::CAL_ADS_MENU; renderADSMenu(); }
+          else { // cfgCursor==4 -> Tiempos bombeo
+            ptCursor = 0;
+            view = View::CFG_PUMP_TIMES_MENU;
+            renderPumpTimesMenu();
+          }
           break;
         case Btn::ESC:
           view = View::ROOT; lcd.clear(); renderRoot(); break;
@@ -1029,6 +1341,43 @@ static void MenuDemoTick() {
     case View::CAL_PH_RUN: {
       if (runPHCalibration_7_4(/*samples=*/5)) {
         view = View::CAL_PH_MENU; lcd.clear(); renderPHMenu();
+      }
+    } break;
+
+    // ---- Submenú: Tiempos bombeo ----
+    case View::CFG_PUMP_TIMES_MENU: {
+      switch (readLatched()) {
+        case Btn::UP:
+          ptCursor = (ptCursor==0)? (PT_N-1) : (ptCursor-1);
+          lcd.clear(); renderPumpTimesMenu(); break;
+        case Btn::DOWN:
+          ptCursor = (ptCursor+1) % PT_N;
+          lcd.clear(); renderPumpTimesMenu(); break;
+        case Btn::OK:
+          lcd.clear();
+          if (ptCursor == 0) {  // Configurar
+            view = View::CFG_PUMP_TIMES_SET;
+          } else {              // Probar
+            view = View::CFG_PUMP_TIMES_TEST;
+          }
+          break;
+        case Btn::ESC:
+          view = View::CONFIG; lcd.clear(); renderConfig(); break;
+        default: break;
+      }
+    } break;
+
+    case View::CFG_PUMP_TIMES_SET: {
+      if (PumpTimesSetWizard()) {
+        view = View::CFG_PUMP_TIMES_MENU;
+        lcd.clear(); renderPumpTimesMenu();
+      }
+    } break;
+
+    case View::CFG_PUMP_TIMES_TEST: {
+      if (PumpTimesTestWizard()) {
+        view = View::CFG_PUMP_TIMES_MENU;
+        lcd.clear(); renderPumpTimesMenu();
       }
     } break;
 
