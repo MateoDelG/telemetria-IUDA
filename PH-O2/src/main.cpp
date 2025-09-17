@@ -17,6 +17,8 @@ PumpsManager pumps;
 PHManager ph(&ads, /*channel=*/0, /*avgSamples=*/6);
 ConfigStore eeprom;
 
+bool startProcess = false;
+
 
 
 void initDualCore();
@@ -35,6 +37,8 @@ float readPH();
 void APIUI();
 static void MenuDemoTick();
 
+static bool AutoModeTick();
+
 void setup() {
   Serial.begin(115200);
   initHardware();
@@ -46,7 +50,7 @@ void setup() {
   initLCD();
   initADC();
   initPH();
-
+  startProcess = true;
 }
 
 void loop() {
@@ -55,16 +59,20 @@ void loop() {
 
 void taskCore0(void *pvParameters) {
   for (;;) {
-    // TestBoard::testPumps(PUMP_1, PUMP_2, PUMP_3, PUMP_4, MIXER);
-    // readThermo();
-    // TestBoard::testButtons();
-    // readADS();
-    // readPH();
-    // delay(1000);
-    // delay(100);
-    MenuDemoTick();
+    if(startProcess){
 
-    vTaskDelay(200 / portTICK_PERIOD_MS); // Espera 100 ms
+      // TestBoard::testPumps(PUMP_1, PUMP_2, PUMP_3, PUMP_4, MIXER);
+      // readThermo();
+      // TestBoard::testButtons();
+      // readADS();
+      // readPH();
+      // delay(1000);
+      // delay(100);
+      // MenuDemoTick();
+      AutoModeTick();
+    }
+
+    vTaskDelay(100 / portTICK_PERIOD_MS); // Espera 100 ms
   }
 }
 //loop
@@ -269,48 +277,6 @@ float readPH() {
   }
 }
 
-void APIUI() {
-  Buttons::testButtons();
-
-  // Determina un único botón activo (latch); prioridad: OK > ESC > UP > DOWN
-  enum class Btn : uint8_t { NONE, OK, ESC, UP, DOWN };
-  Btn active = Btn::NONE;
-
-  if (Buttons::BTN_OK.value)      active = Btn::OK;
-  else if (Buttons::BTN_ESC.value) active = Btn::ESC;
-  else if (Buttons::BTN_UP.value)  active = Btn::UP;
-  else if (Buttons::BTN_DOWN.value)active = Btn::DOWN;
-
-  switch (active) {
-    case Btn::OK:
-      lcd.splash("IUDigital", "de Antioquia", 1000);
-      Buttons::BTN_OK.reset();     // libera el latch
-      break;
-
-    case Btn::ESC:
-      lcd.clear();
-      Buttons::BTN_ESC.reset();    // libera el latch
-      break;
-
-    case Btn::UP:
-      lcd.splash("pH - O2 meter", "v1.0", 1000);
-      Buttons::BTN_UP.reset();     // libera el latch
-      break;
-
-    case Btn::DOWN:
-      for (int i = 0; i <= 100; i += 10) {
-        lcd.progressBar(1, i);
-        delay(100);
-      }
-      Buttons::BTN_DOWN.reset();   // libera el latch
-      break;
-
-    case Btn::NONE:
-    default:
-      // no hay botón latcheado
-      break;
-  }
-}
 
 // Calibración a 2 puntos del ADS usando tu ADS1115Manager (single-ended).
 // Puntos: 0.00 V y 3.31 V. Captura lecturas *sin calibración* y calcula
@@ -995,6 +961,311 @@ static bool ManualLevelsTick() {
 
   return false; // permanecer en esta pantalla
 }
+
+// ---------- MODO AUTOMÁTICO MODULAR (no bloqueante) ----------
+// Inicia SOLO si ambos niveles están OK. Tras cada paso, muestra "OK" 2s.
+static bool AutoModeTick() {
+  // Dependencias externas existentes
+  extern PumpsManager pumps;
+  extern ConfigStore  eeprom;
+  extern float readPH();
+  extern float readThermo();
+
+  // ---------- Declaraciones de tipos de paso ----------
+  enum class Op : uint8_t {
+    READ_LEVELS,
+    PUMP_FOR,      // Enciende bomba 'pump' durante 'dur' ms y luego apaga
+    MIXER_ON,
+    MIXER_OFF,
+    WAIT,          // Espera 'dur' ms
+    READ_PH,
+    END
+  };
+
+  enum class DurKind : uint8_t {
+    CONST,         // usar 'ms' del step
+    KCL, H2O, SAMPLE,
+    DRAIN_2X_SUM,  // 2 * (kcl + h2o)
+    MIX_WAIT_VAR   // variable local (mixWaitMs)
+  };
+
+  struct Step {
+    Op        op;
+    PumpId    pump;      // solo aplica a PUMP_FOR
+    DurKind   dkind;     // cómo calcular duración
+    uint32_t  ms;        // si dkind==CONST
+    const char* label;   // texto base para LCD/log
+  };
+
+  // ---------- Variable local configurable ----------
+  static uint32_t mixWaitMs = 30000;  // 30 s por defecto
+  static const int displayEndMesgMs = 3000;
+
+  // Helpers para tiempos desde EEPROM
+  auto getKclMs    = [&](){ return eeprom.kclFillMs();    };
+  auto getH2oMs    = [&](){ return eeprom.h2oFillMs();    };
+  auto getSampleMs = [&](){ return eeprom.sampleFillMs(); };
+
+  auto computeDurMs = [&](DurKind dk) -> uint32_t {
+    switch (dk) {
+      case DurKind::CONST:        return 0; // el caller usará 'ms' del step
+      case DurKind::KCL:          return getKclMs();
+      case DurKind::H2O:          return getH2oMs();
+      case DurKind::SAMPLE:       return getSampleMs();
+      case DurKind::DRAIN_2X_SUM: return (getKclMs() + getH2oMs()) * 2UL;
+      case DurKind::MIX_WAIT_VAR: return mixWaitMs;
+      default: return 0;
+    }
+  };
+
+  // ---------- Secuencia de pasos (editable) ----------
+  static const Step STEPS[] = {
+    { Op::READ_LEVELS, PumpId::KCL,    DurKind::CONST,       0, "Lee niveles" },
+    { Op::PUMP_FOR,    PumpId::DRAIN,  DurKind::DRAIN_2X_SUM,0, "Drenando"    },
+    { Op::PUMP_FOR,    PumpId::SAMPLE, DurKind::SAMPLE,      0, "Sample"      },
+    { Op::MIXER_ON,    PumpId::MIXER,  DurKind::CONST,       0, "Mixer ON"    },
+    { Op::WAIT,        PumpId::MIXER,  DurKind::MIX_WAIT_VAR,0, "Mezclando"   },
+    { Op::READ_PH,     PumpId::MIXER,  DurKind::CONST,       0, "Leer pH"     },
+    { Op::MIXER_OFF,   PumpId::MIXER,  DurKind::CONST,       0, "Mixer OFF"   },
+    { Op::PUMP_FOR,    PumpId::DRAIN,  DurKind::DRAIN_2X_SUM,0, "Drenando"    },
+    { Op::PUMP_FOR,    PumpId::H2O,    DurKind::H2O,         0, "H2O"         },
+    { Op::PUMP_FOR,    PumpId::KCL,    DurKind::KCL,         0, "KCL"         },
+    { Op::END,         PumpId::KCL,    DurKind::CONST,       0, "FIN"         },
+  };
+  static const uint8_t N_STEPS = sizeof(STEPS)/sizeof(STEPS[0]);
+
+  // ---------- Estado interno del motor ----------
+  enum class Phase : uint8_t { ENTER, RUN, POST, EXIT };
+  static bool     started      = false;   // arranque del proceso
+  static uint8_t  idx          = 0;
+  static Phase    phase        = Phase::ENTER;
+  static uint32_t curDur       = 0;
+  static unsigned long t0      = 0;       // inicio de RUN
+  static unsigned long tPost   = 0;       // inicio de POST (hold de 2s)
+  static float     lastPHShown = NAN;
+
+  // Para espera previa por niveles OK
+  static int8_t lastH2O = -1; // -1 desconocido, 0=OK, 1=BAJO
+  static int8_t lastKCL = -1;
+
+  // ---------- UI helpers ----------
+  auto show = [&](const char* l0, const char* l1){
+    lcd.printAt(0,0, l0);
+    lcd.printAt(0,1, l1);
+  };
+  auto progressSec = [&](const char* title){
+    unsigned long secs = (millis() - t0) / 1000UL;
+    char L0[17], L1[17];
+    snprintf(L0, sizeof(L0), "%s", title);
+    unsigned long tot = (curDur > 0) ? (curDur/1000UL) : 0;
+    snprintf(L1, sizeof(L1), "t=%lus/%lus", secs, tot);
+    show(L0, L1);
+  };
+
+  // ---------- ESC cancela todo ----------
+  if (Buttons::BTN_ESC.value) {
+    Buttons::BTN_ESC.reset();
+    pumps.allOff();
+    lcd.splash("AUTO cancelado","", 800);
+    started = false; idx = 0; phase = Phase::ENTER; lastPHShown = NAN;
+    lastH2O = lastKCL = -1;
+    return true;
+  }
+
+  // ---------- Espera previa: ambos niveles deben estar OK ----------
+// ---------- Espera previa: ambos niveles deben estar OK ----------
+if (!started) {
+  bool h2o_raw = pumps.levelH2O();   // true = BAJO
+  bool kcl_raw = pumps.levelKCL();   // true = BAJO
+  int8_t h2o_i = h2o_raw ? 1 : 0;    // 1=BAJO, 0=OK
+  int8_t kcl_i = kcl_raw ? 1 : 0;
+
+  if (h2o_i != lastH2O || kcl_i != lastKCL || lastH2O < 0 || lastKCL < 0) {
+    char l0[17], l1[17];
+    snprintf(l0, sizeof(l0), "Nivel H2O:%s", h2o_raw ? "BAJO" : "OK");
+    snprintf(l1, sizeof(l1), "Nivel KCL:%s", kcl_raw ? "BAJO" : "OK");
+    show(l0, l1);
+    lastH2O = h2o_i;
+    lastKCL = kcl_i;
+  }
+
+  // *** NUEVO: permitir cancelar con ESC mientras esperamos niveles OK ***
+  if (Buttons::BTN_ESC.value) {
+    Buttons::BTN_ESC.reset();
+    pumps.allOff();
+    lcd.splash("AUTO cancelado","", 800);
+    started = false; idx = 0; phase = Phase::ENTER; lastPHShown = NAN;
+    lastH2O = lastKCL = -1;
+    return true;    // <- salir del modo auto
+  }
+
+  // Si alguno está BAJO, no iniciamos aún
+  if (h2o_raw || kcl_raw) {
+    return false; // seguir esperando; ESC disponible para cancelar
+  }
+
+  // Ambos OK -> iniciar ahora
+  pumps.allOff();
+  lcd.splash("Niveles OK","Iniciando...", 500);
+  started      = true;
+  idx          = 0;
+  phase        = Phase::ENTER;
+  curDur       = 0;
+  lastPHShown  = NAN;
+}
+
+
+  // ---------- Ejecución de la receta ----------
+  const Step& S = STEPS[idx];
+
+  switch (S.op) {
+    case Op::READ_LEVELS: {
+      if (phase == Phase::ENTER) {
+        bool h2o = pumps.levelH2O();
+        bool kcl = pumps.levelKCL();
+        char L0[17], L1[17];
+        snprintf(L0, sizeof(L0), "Nivel H2O:%s", h2o ? "BAJO" : "OK");
+        snprintf(L1, sizeof(L1), "Nivel KCL:%s", kcl ? "BAJO" : "OK");
+        show(L0, L1);
+        tPost = millis();
+        phase = Phase::POST;
+      }
+      else if (phase == Phase::POST) {
+        if (millis() - tPost >= displayEndMesgMs) phase = Phase::EXIT;
+      }
+      else if (phase == Phase::EXIT) {
+        idx++; phase = Phase::ENTER;
+      }
+    } break;
+
+    case Op::PUMP_FOR: {
+      if (phase == Phase::ENTER) {
+        curDur = (S.dkind == DurKind::CONST) ? S.ms : computeDurMs(S.dkind);
+        if (curDur == 0) curDur = 500; // mínimo
+        pumps.on(S.pump);
+        t0 = millis();
+        phase = Phase::RUN;
+        progressSec(S.label);
+      }
+      else if (phase == Phase::RUN) {
+        progressSec(S.label);
+        if ((millis() - t0) >= curDur) {
+          pumps.off(S.pump);
+          char L0[17], L1[17];
+          snprintf(L0, sizeof(L0), "%s", S.label);
+          snprintf(L1, sizeof(L1), "OK");
+          show(L0, L1);
+          tPost = millis();
+          phase = Phase::POST;
+        }
+      }
+      else if (phase == Phase::POST) {
+        if (millis() - tPost >= displayEndMesgMs) phase = Phase::EXIT;
+      }
+      else if (phase == Phase::EXIT) {
+        idx++; phase = Phase::ENTER;
+      }
+    } break;
+
+    case Op::MIXER_ON: {
+      if (phase == Phase::ENTER) {
+        pumps.on(PumpId::MIXER);
+        show("Mixer ON","OK");
+        tPost = millis();
+        phase = Phase::POST;
+      }
+      else if (phase == Phase::POST) {
+        if (millis() - tPost >= displayEndMesgMs) phase = Phase::EXIT;
+      }
+      else if (phase == Phase::EXIT) {
+        idx++; phase = Phase::ENTER;
+      }
+    } break;
+
+    case Op::MIXER_OFF: {
+      if (phase == Phase::ENTER) {
+        pumps.off(PumpId::MIXER);
+        show("Mixer OFF","OK");
+        tPost = millis();
+        phase = Phase::POST;
+      }
+      else if (phase == Phase::POST) {
+        if (millis() - tPost >= displayEndMesgMs) phase = Phase::EXIT;
+      }
+      else if (phase == Phase::EXIT) {
+        idx++; phase = Phase::ENTER;
+      }
+    } break;
+
+    case Op::WAIT: {
+      if (phase == Phase::ENTER) {
+        curDur = (S.dkind == DurKind::CONST) ? S.ms : computeDurMs(S.dkind);
+        t0 = millis();
+        phase = Phase::RUN;
+        progressSec(S.label);
+      }
+      else if (phase == Phase::RUN) {
+        progressSec(S.label);
+        if ((millis() - t0) >= curDur) {
+          char L0[17], L1[17];
+          snprintf(L0, sizeof(L0), "%s", S.label);
+          snprintf(L1, sizeof(L1), "OK");
+          show(L0, L1);
+          tPost = millis();
+          phase = Phase::POST;
+        }
+      }
+      else if (phase == Phase::POST) {
+        if (millis() - tPost >= displayEndMesgMs) phase = Phase::EXIT;
+      }
+      else if (phase == Phase::EXIT) {
+        idx++; phase = Phase::ENTER;
+      }
+    } break;
+
+    case Op::READ_PH: {
+      if (phase == Phase::ENTER) {
+        char L0[17], L1[17];
+        snprintf(L0, sizeof(L0), "Leyendo pH");
+        snprintf(L1, sizeof(L1), " ");
+        show(L0, L1);
+        float ph = readPH();
+        lastPHShown = ph;
+        snprintf(L0, sizeof(L0), "pH: %.02f", ph);
+        snprintf(L1, sizeof(L1), "OK");
+        show(L0, L1);
+        tPost = millis();
+        phase = Phase::POST;
+      }
+      else if (phase == Phase::POST) {
+        if (millis() - tPost >= displayEndMesgMs) phase = Phase::EXIT;
+      }
+      else if (phase == Phase::EXIT) {
+        idx++; phase = Phase::ENTER;
+      }
+    } break;
+
+    case Op::END: {
+      pumps.allOff();
+      lcd.splash("AUTO","Completado", 900);
+      started = false; idx = 0; phase = Phase::ENTER; lastPHShown = NAN;
+      lastH2O = lastKCL = -1;
+      return true;
+    }
+
+    default: {
+      // Failsafe
+      pumps.allOff();
+      lcd.splash("AUTO","Error step", 800);
+      started = false; idx = 0; phase = Phase::ENTER; lastPHShown = NAN;
+      lastH2O = lastKCL = -1;
+      return true;
+    }
+  }
+
+  return false; // seguir en automático
+}
+
 
 
 static void MenuDemoTick() {
