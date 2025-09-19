@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <globals.h>
 
 namespace UartProto {
 
@@ -49,8 +50,8 @@ private:
   // Petición de medición automática (sin callback)
   volatile bool autoMeasureRequested_ = false;
 
-  volatile float  last_ph_ = NAN;
-  volatile float  last_tempC_ = NAN;
+  volatile float  last_ph_ = 7;
+  volatile float  last_tempC_ = 25;
   String          last_result_ = "OK";
   volatile bool   last_has_data_ = false;
 
