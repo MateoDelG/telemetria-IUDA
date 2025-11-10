@@ -1,0 +1,19 @@
+﻿    PCF8574 io;
+    TwoWire* wire = &Wire;
+    bool    present = false;
+    bool    state[8] = {false,false,false,false,false,false,false,false};
+    // En ESP32 disponemos de constructor con TwoWire* y pines
+    #if defined(ESP32)
+    SampleModule(TwoWire* bus, uint8_t addr, int sda, int scl)
+      : io(bus, addr, sda, scl), wire(bus) {}
+    #endif
+    // Variante sin pines explÃ­citos
+    SampleModule(TwoWire* bus, uint8_t addr)
+      : io(bus, addr), wire(bus) {}
+  };
+
+  // Primario
+  PCF8574 primary_{0x20};
+  bool    primaryInited_   = false;
+  Chan    prim_[static_cast<uint8_t>(PumpId::COUNT)];
+

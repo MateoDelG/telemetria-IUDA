@@ -1,78 +1,101 @@
 #pragma once
 #include <Arduino.h>
+#include <Wire.h>
 
-// Identificadores de actuadores (conserva MIXER)
+/*
+  pumps_manager (fase 2)
+  ----------------------
+  - Encapsula PCF8574 con mapa fijo de pines para bombas.
+  - Política de activación global "activeHigh":
+      activeHigh = true  → ON lógico escribe bit=1
+      activeHigh = false → ON lógico escribe bit=0  (típico con ULN2803/relés activo-bajo)
+  - SIN inversión especial para MIXER.
+  - Se mantiene acceso de 8 bits (read8/write8) y control por canal.
+*/
+
 enum class PumpId : uint8_t {
-  KCL = 0,
-  H2O,
-  SAMPLE,
-  DRAIN,
-  MIXER,
-  COUNT
+  KCL = 0,      // P0
+  H2O,          // P1
+  DRAIN,        // P2
+  MIXER,        // P3
+  SAMPLE1,      // P4
+  SAMPLE2,      // P5
+  SAMPLE3,      // P6
+  SAMPLE4,      // P7
+  COUNT         // 8
 };
 
 class PumpsManager {
 public:
-  PumpsManager();
+  PumpsManager() = default;
 
-  // Bombas/Mixer
-  bool begin(uint8_t pinKCL,
-             uint8_t pinH2O,
-             uint8_t pinSample,
-             uint8_t pinDrain,
-             uint8_t pinMixer,
-             bool activeHigh = true,
-             bool mixerInverted = true);
+  // Inicializa el PCF8574. Deja el registro a 0xFF (liberado).
+  bool begin(uint8_t addr, int sda, int scl, uint32_t i2cHz = 100000, bool activeHigh = true);
 
-  void on (PumpId id);
-  void off(PumpId id);
-  void set(PumpId id, bool enable);
-  bool isOn(PumpId id) const;
+  // --- API de 8 bits (por si quieres diagnósticos rápidos)
+  bool    write8(uint8_t value);     // escribe el byte completo
+  uint8_t read8();                   // lee el byte actual del PCF
+  bool    ping();                    // ping I2C
+
+  // --- API por canal (módulo fijo)
+  void on (PumpId id);               // enciende canal (lógico)
+  void off(PumpId id);               // apaga canal  (lógico)
+  void set(PumpId id, bool enable);  // set lógico
+  bool isOn(PumpId id) const;        // último estado lógico
 
   // Helpers
-  inline void kclOn()    { on (PumpId::KCL);    }
-  inline void kclOff()   { off(PumpId::KCL);    }
-  inline void h2oOn()    { on (PumpId::H2O);    }
-  inline void h2oOff()   { off(PumpId::H2O);    }
-  inline void sampleOn() { on (PumpId::SAMPLE); }
-  inline void sampleOff(){ off(PumpId::SAMPLE); }
-  inline void drainOn()  { on (PumpId::DRAIN);  }
-  inline void drainOff() { off(PumpId::DRAIN);  }
-  inline void mixerOn()  { on (PumpId::MIXER);  }
-  inline void mixerOff() { off(PumpId::MIXER);  }
+  inline void kclOn()      { on (PumpId::KCL);     }
+  inline void kclOff()     { off(PumpId::KCL);     }
+  inline void h2oOn()      { on (PumpId::H2O);     }
+  inline void h2oOff()     { off(PumpId::H2O);     }
+  inline void drainOn()    { on (PumpId::DRAIN);   }
+  inline void drainOff()   { off(PumpId::DRAIN);   }
+  inline void mixerOn()    { on (PumpId::MIXER);   }
+  inline void mixerOff()   { off(PumpId::MIXER);   }
+  inline void sample1On()  { on (PumpId::SAMPLE1); }
+  inline void sample1Off() { off(PumpId::SAMPLE1); }
+  inline void sample2On()  { on (PumpId::SAMPLE2); }
+  inline void sample2Off() { off(PumpId::SAMPLE2); }
+  inline void sample3On()  { on (PumpId::SAMPLE3); }
+  inline void sample3Off() { off(PumpId::SAMPLE3); }
+  inline void sample4On()  { on (PumpId::SAMPLE4); }
+  inline void sample4Off() { off(PumpId::SAMPLE4); }
 
+  // Apaga todos los canales del módulo fijo (usa lógica activa global).
   void allOff();
+
+  // Configura lógica en caliente y re-aplica el registro sombra.
   void setActiveHigh(bool activeHigh);
-  void setMixerInverted(bool inverted);
 
-  // -----------------------------
-  // Sensores de nivel (H2O / KCL)
-  // -----------------------------
-  // Nota: en ESP32 los pines 32-39 no tienen pull-up interno. Usa INPUT si no tienes resistencia externa.
-  void beginLevels(uint8_t pinLevelH2O, uint8_t pinLevelKCL, bool usePullup = true);
-
-  // Lecturas crudas (true = HIGH, false = LOW)
-  bool levelH2O() const;  // digitalRead(pinH2O) == HIGH
-  bool levelKCL() const;  // digitalRead(pinKCL) == HIGH
+  // Info
+  inline uint8_t address() const     { return addr_; }
+  inline uint8_t lastWritten() const { return shadow_; }
+  static void    printByteState(uint8_t value);
 
 private:
-  struct Chan {
-    uint8_t pin   = 0xFF;
-    bool    state = false;   // true=ON lógico
-  };
+  // --- Config/I2C
+  uint8_t  addr_        = 0x20;
+  int      sda_         = -1;
+  int      scl_         = -1;
+  uint32_t i2cHz_       = 100000;
+  bool     wireBegun_   = false;
 
-  // Bombas/Mixer
-  Chan  ch_[static_cast<uint8_t>(PumpId::COUNT)];
-  bool  activeHigh_     = true;  // lógica bombas
-  bool  mixerInverted_  = true;  // mixer usa !activeHigh_ si true
-  bool  inited_         = false;
+  // --- Lógica/estado
+  bool     activeHigh_  = true;        // política global
+  bool     states_[8]   = {false,false,false,false,false,false,false,false}; // ON lógico por canal
+  uint8_t  shadow_      = 0xFF;        // último byte escrito al PCF (físico)
 
-  // Sensores de nivel
-  uint8_t levelPinH2O_  = 0xFF;
-  uint8_t levelPinKCL_  = 0xFF;
-  bool    levelsInited_ = false;
-  bool    levelsUsePullup_ = true;
+  // --- Internas
+  void ensureWireBegun_();
+  static inline uint8_t bitOf(PumpId id) { return static_cast<uint8_t>(id); }
 
-  bool activeHighFor_(PumpId id) const;
-  void apply_(PumpId id);
+  // Traduce ON lógico de un canal al valor del bit según activeHigh_
+  inline uint8_t bitValueFor(bool on) const {
+    // true  → 1 si activeHigh, 0 si activo-bajo
+    // false → 0 si activeHigh, 1 si activo-bajo
+    return on ? (activeHigh_ ? 1 : 0) : (activeHigh_ ? 0 : 1);
+  }
+
+  // Reconstruye el shadow_ a partir de states_ y lo escribe si cambió.
+  bool rebuildAndWriteShadow_();
 };
