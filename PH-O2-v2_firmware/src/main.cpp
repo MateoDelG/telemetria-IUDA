@@ -3,6 +3,7 @@
 #include "menu_manager.h"
 #include "pH_manager.h"
 #include "pumps_manager.h"
+#include "level_sensors_manager.h"
 #include "test_board.h"
 #include "uart_manager.h"
 #include <Arduino.h>
@@ -20,6 +21,7 @@ UartProto::UARTManager uart2(Serial2);
 PumpsManager pumps;
 PHManager ph(&ads, /*channel=*/0, /*avgSamples=*/6);
 ConfigStore eeprom;
+LevelSensorsManager levels; 
 
 bool startProcess = false;
 
@@ -42,14 +44,14 @@ static void MenuDemoTick();
 static bool AutoModeTick();
 
 void setup() {
+  initPumps();
   Serial.begin(115200);
   Serial2.begin(115200);
   initHardware();
   initDualCore();
   initEEPROM();
   initWiFi();
-  delay(5000);
-  initPumps();
+  // delay(5000);
   initThermo();
   initLCD();
   initADC();
@@ -68,12 +70,10 @@ void taskCore0(void *pvParameters) {
       // TestBoard::testButtons();
       // readADS();
       // readPH();
-      // MenuDemoTick();
+      MenuDemoTick();
       // AutoModeTick();
-      pumps.kclOn();
-      delay(1000);
-      pumps.kclOff();
-      delay(2000);
+
+
     }
 
     vTaskDelay(100 / portTICK_PERIOD_MS); // Espera 100 ms
@@ -115,6 +115,9 @@ void initHardware() {
   pinMode(BUZZER, OUTPUT);
 
   digitalWrite(BUZZER, LOW);
+
+  levels.begin(SENSOR_LEVEL_O2, SENSOR_LEVEL_PH, SENSOR_LEVEL_KCL,
+               SENSOR_LEVEL_H2O);
 }
 
 void initWiFi() {
@@ -259,20 +262,57 @@ float readThermo() {
 }
 
 float readPH() {
-  float tC = readThermo(); // compensa por temperatura si tu 'ph.readPH' lo hace
-  uart2.setLastTempC(tC);  // Actualiza temp en UART
-  float phValue = NAN, volts = NAN;
+  extern ConfigStore eeprom;
+  extern UartProto::UARTManager uart2;
+  extern float readThermo();
 
-  if (ph.readPH(tC, phValue, &volts)) {
-    remoteManager.log("pH = " + String(phValue, 3) +
-                      "   V = " + String(volts, 4));
-    uart2.setLastPh(phValue);
-    return phValue;
-  } else {
+  // 1) Leer temperatura actual (para compensación)
+  float tC = readThermo();
+  bool tOk = isfinite(tC) && tC > -40.0f && tC < 125.0f;
+  if (!tOk) tC = 25.0f; // fallback si el sensor falla
+  uart2.setLastTempC(tC);
+
+  // 2) Leer pH con compensación de temperatura
+  float phValue = NAN, volts = NAN;
+  if (!ph.readPH(tC, phValue, &volts)) {
     remoteManager.log(String("pH ERR: ") + ph.lastError());
+    uart2.setLastPh(-99.0f);
     return -99.0f;
   }
+
+  // 3) Determinar tipo de calibración vigente
+  float V4 = NAN, V7 = NAN, V10 = NAN, Tcal = NAN;
+  bool has3p = false;
+  bool has2p = false;
+
+  // Intentar leer 3 puntos (si el layout lo tiene)
+  eeprom.getPH3pt(V4, V7, V10, Tcal);
+  if (isfinite(V4) && isfinite(V7) && isfinite(V10)) has3p = true;
+
+  // Si no hay 3 puntos válidos, intentar 2 puntos
+  if (!has3p) {
+    float V7b = NAN, V4b = NAN, Tc2 = NAN;
+    eeprom.getPH2pt(V7b, V4b, Tc2);
+    if (isfinite(V7b) && isfinite(V4b)) has2p = true;
+  }
+
+  // 4) Mostrar en log UART según tipo de calibración
+  String calTag;
+  if (has3p)      calTag = "[3p]";
+  else if (has2p) calTag = "[2p]";
+  else            calTag = "[NoCal]";
+
+  // 5) Registro en log y UART
+  remoteManager.log(
+    "pH " + calTag + " = " + String(phValue, 3) +
+    "  V=" + String(volts, 4) +
+    "  T=" + String(tC, 1) + "°C"
+  );
+
+  uart2.setLastPh(phValue);
+  return phValue;
 }
+
 
 // Calibración a 2 puntos del ADS usando tu ADS1115Manager (single-ended).
 // Puntos: 0.00 V y 3.31 V. Captura lecturas *sin calibración* y calcula
@@ -435,10 +475,16 @@ static bool runADSCalibration_0V_3p31V(uint8_t channel = 0,
   }
 }
 
-// Calibración pH 2 puntos fija: 7.00 y 4.00
-// Usa ph.readPH(tC, phValue, &volts) para medir V y readThermo() para T.
-// No persiste en EEPROM (por ahora). Llama cada tick en la vista "Calibrar pH".
+
 static bool runPHCalibration_7_4(uint8_t samples = 64) {
+  // Externs típicos del proyecto
+  extern PHManager               ph;
+  extern ADS1115Manager          ads;
+  extern float                   readThermo();
+  extern ConfigStore             eeprom;
+  extern UartProto::UARTManager  uart2;
+  // y, por supuesto, el lcd y Buttons::* ya existentes
+
   enum class Step : uint8_t {
     START,
     WAIT_7,
@@ -451,191 +497,663 @@ static bool runPHCalibration_7_4(uint8_t samples = 64) {
   };
   static Step step = Step::START;
 
-  static float V7 = NAN, V4 = NAN; // voltajes promediados
+  static float V7 = NAN, V4 = NAN; // voltajes (mediana)
   static float T1 = NAN, T2 = NAN; // temperaturas (trazabilidad)
 
   // --- UI helpers ---
   auto title = []() { lcd.printAt(0, 0, "Calibrar pH"); };
-  auto ask7 = [&]() {
-    title();
-    lcd.printAt(0, 1, "Buffer 7.00  OK");
-  }; // <-- captura [&]
-  auto ask4 = [&]() {
-    title();
-    lcd.printAt(0, 1, "Buffer 4.00  OK");
-  }; // <-- captura [&]
-  auto busy = [&](const char *m) {
-    title();
-    lcd.printAt(0, 1, m);
-  }; // <-- captura [&]
-  auto showErr = [](const char *a, const char *b = "") {
-    lcd.splash(a, b, 900);
+  auto ask7 = [&]() { title(); lcd.printAt(0, 1, "Buffer 7.00  OK"); };
+  auto ask4 = [&]() { title(); lcd.printAt(0, 1, "Buffer 4.00  OK"); };
+  auto busy = [&](const char *m){ title(); lcd.printAt(0, 1, m); };
+  auto showErr = [](const char *a, const char *b = "") { lcd.splash(a, b, 900); };
+
+  // ---- Utilidad: ordenación por insertion sort (simple y estable) ----
+  auto insertionSort = [](float* arr, uint16_t n){
+    for (uint16_t i = 1; i < n; ++i) {
+      float key = arr[i];
+      int j = (int)i - 1;
+      while (j >= 0 && arr[j] > key) {
+        arr[j+1] = arr[j];
+        --j;
+      }
+      arr[j+1] = key;
+    }
   };
 
-  // Promedia VOLTAJE usando ph.readPH()
-  auto avgVoltPH = [&](uint16_t N) -> float {
-    float accV = 0.0f;
+  // ---- Mediana del VOLTAJE usando ph.readPH() (con compensación T) ----
+  auto medianVoltPH = [&](uint16_t N) -> float {
+    // Bound razonable para stack en microcontrolador
+    static constexpr uint16_t MAX_S = 128;
+    if (N == 0) N = 1;
+    if (N > MAX_S) N = MAX_S;
+
+    float buf[MAX_S];
+    uint16_t k = 0;
+
     for (uint16_t i = 0; i < N; ++i) {
-      float tC = readThermo(); // puede devolver -1 o NaN
-      bool tOk = (!isnan(tC) && tC != -1.0f && tC > -40.0f && tC < 125.0f);
+      float tC = readThermo();
+      bool tOk = isfinite(tC) && tC > -40.0f && tC < 125.0f;
       float tUsed = tOk ? tC : 25.0f;
 
-      float phVal = NAN;
-      float v = NAN;
+      float phVal = NAN, v = NAN;
       if (!ph.readPH(tUsed, phVal, &v)) {
-        remoteManager.log(String("pH cal readPH ERR: ") + ph.lastError());
-        return NAN;
+        // si una lectura falla, simplemente la omitimos
+      } else if (isfinite(v)) {
+        buf[k++] = v;
       }
-      accV += v;
-      delay(4);
+      delay(4); // pequeño settling
     }
-    return accV / float(N);
+
+    if (k < 3) {
+      // muy pocas válidas para una mediana robusta
+      return NAN;
+    }
+
+    insertionSort(buf, k);
+    if (k & 1) {
+      // impar
+      return buf[k/2];
+    } else {
+      // par
+      uint16_t r = k/2;
+      return 0.5f * (buf[r-1] + buf[r]);
+    }
   };
 
-  // Buttons::testButtons();
-
   switch (step) {
-  case Step::START:
-    ads.setAveraging(samples);
-    lcd.clear();
-    ask7();
-    step = Step::WAIT_7;
-    return false;
-
-  case Step::WAIT_7:
-    if (Buttons::BTN_ESC.value) {
-      Buttons::BTN_ESC.reset();
-      step = Step::CANCEL;
+    case Step::START: {
+      ads.setAveraging(samples);
+      lcd.clear();
+      ask7();
+      step = Step::WAIT_7;
       return false;
     }
-    if (Buttons::BTN_OK.value) {
-      Buttons::BTN_OK.reset();
-      step = Step::CAPT_7;
+
+    case Step::WAIT_7: {
+      if (Buttons::BTN_ESC.value) { Buttons::BTN_ESC.reset(); step = Step::CANCEL; return false; }
+      if (Buttons::BTN_OK.value)  { Buttons::BTN_OK.reset();  step = Step::CAPT_7; return false; }
       return false;
     }
-    return false;
 
-  case Step::CAPT_7: {
-    busy("Midiendo pH7...");
-    V7 = avgVoltPH(samples);
-    T1 = readThermo();
-    if (isnan(V7)) {
-      showErr("Error lectura", "pH 7.00");
-      step = Step::CANCEL;
+    case Step::CAPT_7: {
+      busy("Midiendo pH7...");
+      V7 = medianVoltPH(samples);
+      T1 = readThermo();
+      if (!isfinite(V7)) {
+        showErr("Error lectura", "pH 7.00");
+        step = Step::CANCEL;
+        return false;
+      }
+      if (&remoteManager) remoteManager.log(String("pH cal: V7=") + String(V7,5) + " T1=" + String(T1,1));
+      lcd.splash("pH 7.00 OK", "", 600);
+      lcd.clear();
+      ask4();
+      step = Step::WAIT_4;
       return false;
     }
-    remoteManager.log(String("pH cal: V7=") + String(V7, 5) +
-                      " T1=" + String(T1, 1));
-    lcd.splash("pH 7.00 OK", "", 600);
-    lcd.clear();
-    ask4();
-    step = Step::WAIT_4;
-    return false;
-  }
 
-  case Step::WAIT_4:
-    if (Buttons::BTN_ESC.value) {
-      Buttons::BTN_ESC.reset();
-      step = Step::CANCEL;
+    case Step::WAIT_4: {
+      if (Buttons::BTN_ESC.value) { Buttons::BTN_ESC.reset(); step = Step::CANCEL; return false; }
+      if (Buttons::BTN_OK.value)  { Buttons::BTN_OK.reset();  step = Step::CAPT_4; return false; }
       return false;
     }
-    if (Buttons::BTN_OK.value) {
-      Buttons::BTN_OK.reset();
-      step = Step::CAPT_4;
+
+    case Step::CAPT_4: {
+      busy("Midiendo pH4...");
+      V4 = medianVoltPH(samples);
+      T2 = readThermo();
+      if (!isfinite(V4)) {
+        showErr("Error lectura", "pH 4.00");
+        step = Step::CANCEL;
+        return false;
+      }
+      if (&remoteManager) remoteManager.log(String("pH cal: V4=") + String(V4,5) + " T2=" + String(T2,1));
+      step = Step::APPLY;
       return false;
     }
-    return false;
 
-  case Step::CAPT_4: {
-    busy("Midiendo pH4...");
-    V4 = avgVoltPH(samples);
-    T2 = readThermo();
-    if (isnan(V4)) {
-      showErr("Error lectura", "pH 4.00");
-      step = Step::CANCEL;
+    case Step::APPLY: {
+      // Temperatura de calibración (promedio válido, o fallback 25 °C)
+      float tCalC;
+      bool t1ok = isfinite(T1) && T1 > -40.0f && T1 < 125.0f;
+      bool t2ok = isfinite(T2) && T2 > -40.0f && T2 < 125.0f;
+      if (t1ok && t2ok)      tCalC = 0.5f * (T1 + T2);
+      else if (t1ok)         tCalC = T1;
+      else if (t2ok)         tCalC = T2;
+      else                   tCalC = 25.0f;
+
+      // Aplica en el driver -> usa VOLTAJES mediana
+      ph.setTwoPointCalibration(7.00f, V7, 4.00f, V4, tCalC);
+
+      // Persistir en EEPROM (2p) e invalidar 3p
+      eeprom.setPH2pt(V7, V4, tCalC);
+      eeprom.setPH3pt(NAN, NAN, NAN, NAN);
+      #ifdef CONFIGSTORE_HAS_PH_CAL_MODE
+        eeprom.setPHCalMode(ConfigStore::PHCalMode::PH2);
+      #endif
+
+      if (!eeprom.save()) {
+        if (&remoteManager) remoteManager.log(String("EEPROM save PH2pt fallo: ") + eeprom.lastError());
+      } else {
+        if (&remoteManager) remoteManager.log("EEPROM: PH2pt guardado (3p invalidado)");
+      }
+
+      uart2.setLastResult("CAL_PH_2PT_OK");
+
+      char l2[17];
+      snprintf(l2, sizeof(l2), "V7=%.3f V4=%.3f", V7, V4);
+      lcd.splash("pH calibrado", l2, 900);
+      if (&remoteManager) remoteManager.log(String("pH cal 2pt OK (Tcal=") + String(tCalC,1) + "C)");
+      step = Step::DONE;
       return false;
     }
-    remoteManager.log(String("pH cal: V4=") + String(V4, 5) +
-                      " T2=" + String(T2, 1));
-    step = Step::APPLY;
-    return false;
-  }
 
-  case Step::APPLY: {
-    // Temperatura de calibración (promedio válido, o fallback 25 °C)
-    float tCalC;
-    bool t1ok = (!isnan(T1) && T1 > -40.0f && T1 < 125.0f);
-    bool t2ok = (!isnan(T2) && T2 > -40.0f && T2 < 125.0f);
-    if (t1ok && t2ok)
-      tCalC = 0.5f * (T1 + T2);
-    else if (t1ok)
-      tCalC = T1;
-    else if (t2ok)
-      tCalC = T2;
-    else
-      tCalC = 25.0f;
-
-    // Aplica tu API de calibración a 2 puntos (7.00 y 4.00) con los VOLTAJES
-    // medidos
-    ph.setTwoPointCalibration(7.00f, V7, 4.00f, V4, tCalC);
-    extern ConfigStore eeprom;
-
-    eeprom.setPH2pt(V7, V4, tCalC);
-    if (!eeprom.save()) {
-      remoteManager.log(String("EEPROM save PH2pt fallo: ") +
-                        eeprom.lastError());
-    } else {
-      remoteManager.log("EEPROM: PH2pt guardado");
+    case Step::CANCEL: {
+      lcd.splash("Calibracion", "Cancelada", 700);
+      uart2.setLastResult("CAL_PH_2PT_CANCEL");
+      step = Step::DONE;
+      return false;
     }
 
-    char l2[17];
-    snprintf(l2, sizeof(l2), "V7=%.3f V4=%.3f", V7, V4);
-    lcd.splash("pH calibrado", l2, 900);
-    remoteManager.log(String("pH cal 2pt OK (Tcal=") + String(tCalC, 1) + "C)");
-    step = Step::DONE;
-    return false;
-  }
-
-  case Step::CANCEL:
-    lcd.splash("Calibracion", "Cancelada", 700);
-    step = Step::DONE;
-    return false;
-
-  case Step::DONE:
-  default:
-    step = Step::START;
-    return true;
+    case Step::DONE:
+    default: {
+      step = Step::START;
+      return true;
+    }
   }
 }
 
-// ============================
-//  BOMBEOS: Configurar tiempo
-//  Flujo: elegir bomba -> OK inicia -> ESC detiene y guarda
-//  Devuelve true cuando finaliza (o cancela) para volver al menú anterior.
-// ============================
-static bool PumpTimesSetWizard() {
-  // extern PumpsManager pumps;
-  // extern ConfigStore  eeprom;
+static bool runPHCalibration_4_7_10(uint16_t samples = 64, bool piecewise = false) {
+  // Externs como en 2 puntos
+  extern PHManager               ph;
+  extern ADS1115Manager          ads;
+  extern float                   readThermo();
+  extern ConfigStore             eeprom;
+  extern UartProto::UARTManager  uart2;
 
-  // struct Item { const char* name; PumpId id; bool isStab; };
-  // static const Item items[] = {
-  //   { "KCL",    PumpId::KCL,    false },
-  //   { "H2O",    PumpId::H2O,    false },
-  //   { "SAMPLE", PumpId::SAMPLE, false },
-  //   { "ESTAB",  PumpId::MIXER,  true  },   // <--- NUEVO: tiempo
-  //   estabilización (usa mixer)
+  enum class Step : uint8_t {
+    START,
+    WAIT_4,  CAPT_4,
+    WAIT_7,  CAPT_7,
+    WAIT_10, CAPT_10,
+    APPLY,
+    DONE,
+    CANCEL
+  };
+  static Step step = Step::START;
+
+  // Voltajes (mediana) y temperaturas (trazabilidad)
+  static float V4 = NAN, V7 = NAN, V10 = NAN;
+  static float T4 = NAN, T7 = NAN, T10 = NAN;
+
+  // --- UI helpers ---
+  auto title = []() { lcd.printAt(0,0,"Calibrar pH 3pt"); };
+  auto ask4  = [&](){ title(); lcd.printAt(0,1,"Buffer 4.00  OK"); };
+  auto ask7  = [&](){ title(); lcd.printAt(0,1,"Buffer 7.00  OK"); };
+  auto ask10 = [&](){ title(); lcd.printAt(0,1,"Buffer 10.0 OK"); };
+  auto busy  = [&](const char* m){ title(); lcd.printAt(0,1,m); };
+  auto splash= [&](const char* a,const char* b="", uint16_t ms=800){ lcd.splash(a,b,ms); };
+
+  // ---- Progreso mapeado a 0..100 (mantener “x/sample” pero en % en pantalla) ----
+  auto showProgressPct = [&](const char* etiqueta, uint16_t i, uint16_t N){
+    // i: 1..N
+    uint16_t pct = (N == 0) ? 100 : (uint16_t)((uint32_t)i * 100UL / (uint32_t)N);
+    if (pct > 100) pct = 100;
+    char l0[17], l1[17];
+    snprintf(l0, sizeof(l0), "Calibrar pH");
+    // Ej: "pH7  63%"  (mantiene la idea de avance por muestra, mapeado a 0-100)
+    snprintf(l1, sizeof(l1), "%-4s %3u%%", etiqueta, pct);
+    lcd.printAt(0,0,l0);
+    lcd.printAt(0,1,l1);
+  };
+
+  // ---- Utilidades: insertion sort + mediana ----
+  auto insertionSort = [](float* arr, uint16_t n){
+    for (uint16_t i = 1; i < n; ++i) {
+      float key = arr[i];
+      int j = (int)i - 1;
+      while (j >= 0 && arr[j] > key) { arr[j+1] = arr[j]; --j; }
+      arr[j+1] = key;
+    }
+  };
+  auto medianFrom = [&](float* buf, uint16_t k) -> float {
+    if (k < 3) return NAN;              // muy pocas válidas para robustez
+    insertionSort(buf, k);
+    if (k & 1) return buf[k/2];
+    uint16_t r = k/2; return 0.5f*(buf[r-1] + buf[r]);
+  };
+
+  // ---- Mediana del VOLTAJE (con compensación T) mostrando % de progreso ----
+  auto medianVoltPH = [&](uint16_t N, const char* etiqueta) -> float {
+    static constexpr uint16_t MAX_S = 128;
+    if (N == 0) N = 1;
+    if (N > MAX_S) N = MAX_S;
+
+    float buf[MAX_S];
+    uint16_t k = 0;
+
+    for (uint16_t i = 0; i < N; ++i) {
+      showProgressPct(etiqueta, (uint16_t)(i+1), N);
+
+      float tC = readThermo();
+      bool tOk = isfinite(tC) && tC > -40.0f && tC < 125.0f;
+      float tUsed = tOk ? tC : 25.0f;
+
+      float phVal = NAN, v = NAN;
+      if (ph.readPH(tUsed, phVal, &v) && isfinite(v)) {
+        buf[k++] = v;
+      }
+      delay(4);
+    }
+    return medianFrom(buf, k);
+  };
+
+  Buttons::testButtons();
+
+  switch (step) {
+    case Step::START: {
+      ads.setAveraging((uint8_t)min<uint16_t>(samples, 255));
+      V4 = V7 = V10 = NAN;  T4 = T7 = T10 = NAN;
+      lcd.clear(); ask4();
+      if (&remoteManager) remoteManager.log("pH 3pt: START -> pH4");
+      step = Step::WAIT_4;
+      return false;
+    }
+
+    case Step::WAIT_4:
+      if (Buttons::BTN_ESC.value){ Buttons::BTN_ESC.reset(); step = Step::CANCEL; return false; }
+      if (Buttons::BTN_OK.value) { Buttons::BTN_OK.reset();  step = Step::CAPT_4;  return false; }
+      return false;
+
+    case Step::CAPT_4: {
+      busy("Midiendo pH4...");
+      V4 = medianVoltPH(samples, "pH4");
+      T4 = readThermo();
+      if (!isfinite(V4)) { splash("Error lectura","pH 4.00", 900); step = Step::CANCEL; return false; }
+      if (&remoteManager) remoteManager.log(String("pH 3pt: V4=")+String(V4,5)+" T4="+String(T4,1));
+      splash("pH 4.00 OK","",600);
+      lcd.clear(); ask7();
+      step = Step::WAIT_7;
+      return false;
+    }
+
+    case Step::WAIT_7:
+      if (Buttons::BTN_ESC.value){ Buttons::BTN_ESC.reset(); step = Step::CANCEL; return false; }
+      if (Buttons::BTN_OK.value) { Buttons::BTN_OK.reset();  step = Step::CAPT_7;  return false; }
+      return false;
+
+    case Step::CAPT_7: {
+      busy("Midiendo pH7...");
+      V7 = medianVoltPH(samples, "pH7");
+      T7 = readThermo();
+      if (!isfinite(V7)) { splash("Error lectura","pH 7.00", 900); step = Step::CANCEL; return false; }
+      if (&remoteManager) remoteManager.log(String("pH 3pt: V7=")+String(V7,5)+" T7="+String(T7,1));
+      splash("pH 7.00 OK","",600);
+      lcd.clear(); ask10();
+      step = Step::WAIT_10;
+      return false;
+    }
+
+    case Step::WAIT_10:
+      if (Buttons::BTN_ESC.value){ Buttons::BTN_ESC.reset(); step = Step::CANCEL; return false; }
+      if (Buttons::BTN_OK.value) { Buttons::BTN_OK.reset();  step = Step::CAPT_10; return false; }
+      return false;
+
+    case Step::CAPT_10: {
+      busy("Midiendo pH10...");
+      V10 = medianVoltPH(samples, "pH10");
+      T10 = readThermo();
+      if (!isfinite(V10)) { splash("Error lectura","pH 10.0", 900); step = Step::CANCEL; return false; }
+      if (&remoteManager) remoteManager.log(String("pH 3pt: V10=")+String(V10,5)+" T10="+String(T10,1));
+      step = Step::APPLY;
+      return false;
+    }
+
+    case Step::APPLY: {
+      // Tcal promedio válido (o 25 °C)
+      int nOK = 0; float accT = 0.0f;
+      auto addIfOk = [&](float T){ if (isfinite(T) && T>-40.0f && T<125.0f) { accT += T; ++nOK; } };
+      addIfOk(T4); addIfOk(T7); addIfOk(T10);
+      float tCalC = (nOK > 0) ? (accT / nOK) : 25.0f;
+
+      if (!isfinite(V4) || !isfinite(V7) || !isfinite(V10)) {
+        splash("Cal pH 3pt","incompleta", 900); step = Step::CANCEL; return false;
+      }
+
+      // Persistencia primero
+      eeprom.setPH3pt(V4, V7, V10, tCalC);
+      #ifdef CONFIGSTORE_HAS_PH_CAL_MODE
+        eeprom.setPHCalMode(ConfigStore::PHCalMode::PH3);
+      #endif
+      if (!eeprom.save()) {
+        if (&remoteManager) remoteManager.log(String("EEPROM save PH3pt fallo: ")+eeprom.lastError());
+      } else {
+        if (&remoteManager) remoteManager.log("EEPROM: PH3pt guardado");
+      }
+
+      // Aplicar al PHManager (modo PW o LS según flag)
+      if (!ph.setThreePointCalibration(V4, V7, V10, tCalC, /*piecewise=*/piecewise)) {
+        if (&remoteManager) remoteManager.log("pH 3pt: setThreePointCalibration fallo");
+        splash("PHManager","Set cal 3pt fallo", 900);
+        step = Step::DONE; return false;
+      }
+
+      // UI final
+      char l2[17];
+      snprintf(l2, sizeof(l2), "V4=%.3f V7=%.3f", V4, V7);
+      splash("pH 3pt OK", l2, 700);
+      snprintf(l2, sizeof(l2), "V10=%.3f T=%.1fC", V10, tCalC);
+      splash("Guardado", l2, 900);
+
+      uart2.setLastResult(piecewise ? "CAL_PH_3PT_PW_OK" : "CAL_PH_3PT_LS_OK");
+      step = Step::DONE;
+      return false;
+    }
+
+    case Step::CANCEL:
+      lcd.splash("Calibracion","Cancelada",700);
+      uart2.setLastResult("CAL_PH_3PT_CANCEL");
+      step = Step::DONE;
+      return false;
+
+    case Step::DONE:
+    default:
+      step = Step::START;
+      return true;
+  }
+}
+
+static bool PumpFillLearnWizard() {
+  extern ConfigStore  eeprom;
+  extern PumpsManager pumps;
+
+  enum class ItemId : uint8_t { KCL_FILL, H2O_FILL, SAMPLE_FILL, DRAIN, COUNT };
+  struct Item { const char* name; ItemId id; };
+
+  static const Item items[] = {
+    { "KCL FILL",   ItemId::KCL_FILL   },
+    { "H2O FILL",   ItemId::H2O_FILL   },
+    { "SAMPLE F",   ItemId::SAMPLE_FILL},
+    { "DRAIN",      ItemId::DRAIN      },
+  };
+  static const uint8_t N = (uint8_t)ItemId::COUNT;
+
+  enum class Step : uint8_t { SELECT, WAIT, RUN, DONE };
+  static Step     step          = Step::SELECT;
+  static uint8_t  cursor        = 0;
+  static int8_t   lastCursor    = -1;
+  static bool     needFirstDraw = true;
+  static bool     armed         = false;
+  static unsigned long t0_ms    = 0;
+  static ItemId   fillId        = ItemId::KCL_FILL;
+
+  auto pumpForFill = [&](ItemId id)->PumpId{
+    switch(id){
+      case ItemId::KCL_FILL:    return PumpId::KCL;
+      case ItemId::H2O_FILL:    return PumpId::H2O;
+      case ItemId::SAMPLE_FILL: return PumpId::SAMPLE1;
+      case ItemId::DRAIN:       return PumpId::DRAIN;
+      default: return PumpId::KCL;
+    }
+  };
+
+  // Guardado según layout v6
+  auto saveDurationMs = [&](ItemId id, uint32_t ms){
+    if (id == ItemId::DRAIN) ms = (ms < 500UL) ? 500UL : ms;
+    else                     ms = (ms < 100UL) ? 100UL : ms;
+    switch(id){
+      case ItemId::KCL_FILL:    eeprom.setKclFillMs(ms);     break;
+      case ItemId::H2O_FILL:    eeprom.setH2oFillMs(ms);     break;
+      case ItemId::SAMPLE_FILL: eeprom.setSampleFillMs(ms);  break;
+      case ItemId::DRAIN:       eeprom.setDrainMs(ms);       break;
+      default: break;
+    }
+    eeprom.save();
+  };
+
+  auto renderSelect = [&](bool force=false){
+    if(force || (int8_t)cursor!=lastCursor){
+      char l0[17], l1[17];
+      snprintf(l0,sizeof(l0),"Aprender tiempo");
+      snprintf(l1,sizeof(l1),">%-8s OK>", items[cursor].name);
+      lcd.printAt(0,0,l0); lcd.printAt(0,1,l1);
+      lastCursor=(int8_t)cursor;
+    }
+  };
+  auto renderWait = [&](){
+    char l0[17], l1[17];
+    if (items[cursor].id == ItemId::DRAIN) snprintf(l0,sizeof(l0),"%-8s", items[cursor].name);
+    else                                    snprintf(l0,sizeof(l0),"%-8s FILL", items[cursor].name);
+    snprintf(l1,sizeof(l1),"t=0s  OK:start");
+    lcd.printAt(0,0,l0); lcd.printAt(0,1,l1);
+  };
+  auto renderRun = [&](){
+    unsigned long secs=(millis()-t0_ms)/1000UL;
+    char l0[17], l1[17];
+    if (items[cursor].id == ItemId::DRAIN) snprintf(l0,sizeof(l0),"%-8s", items[cursor].name);
+    else                                    snprintf(l0,sizeof(l0),"%-8s FILL",items[cursor].name);
+    snprintf(l1,sizeof(l1),"t=%lus ESC:stop",(unsigned long)secs);
+    lcd.printAt(0,0,l0); lcd.printAt(0,1,l1);
+  };
+
+  if(needFirstDraw){
+    lcd.clear(); needFirstDraw=false; lastCursor=-1; step=Step::SELECT; armed=false;
+    Buttons::BTN_OK.reset(); Buttons::BTN_ESC.reset(); Buttons::BTN_UP.reset(); Buttons::BTN_DOWN.reset();
+    renderSelect(true);
+  }
+
+  if (Buttons::BTN_ESC.value && step==Step::SELECT){
+    Buttons::BTN_ESC.reset(); needFirstDraw=true; return true;
+  }
+
+  switch(step){
+    case Step::SELECT:{
+      if(!armed){ Buttons::BTN_OK.reset(); Buttons::BTN_ESC.reset(); Buttons::BTN_UP.reset(); Buttons::BTN_DOWN.reset(); armed=true; return false; }
+      if (Buttons::BTN_UP.value){ Buttons::BTN_UP.reset(); cursor=(cursor==0)?(N-1):(cursor-1); renderSelect(true); return false; }
+      if (Buttons::BTN_DOWN.value){ Buttons::BTN_DOWN.reset(); cursor=(cursor+1)%N; renderSelect(true); return false; }
+      if (Buttons::BTN_OK.value){
+        Buttons::BTN_OK.reset(); fillId=items[cursor].id; lcd.clear(); renderWait(); step=Step::WAIT; return false;
+      }
+      return false;
+    }
+    case Step::WAIT:{
+      if (Buttons::BTN_OK.value){
+        Buttons::BTN_OK.reset(); pumps.on(pumpForFill(fillId));
+        t0_ms=millis(); lcd.clear(); renderRun(); step=Step::RUN; return false;
+      }
+      if (Buttons::BTN_ESC.value){
+        Buttons::BTN_ESC.reset(); lcd.splash("Cancelado","",500); step=Step::DONE; return false;
+      }
+      renderWait(); return false;
+    }
+    case Step::RUN:{
+      renderRun();
+      if (Buttons::BTN_ESC.value){
+        Buttons::BTN_ESC.reset();
+        pumps.off(pumpForFill(fillId));
+        uint32_t ms=(uint32_t)(millis()-t0_ms);
+        saveDurationMs(fillId, ms);
+        char l0[17], l1[17];
+        if (items[cursor].id == ItemId::DRAIN) snprintf(l0,sizeof(l0),"%-8s",items[cursor].name);
+        else                                    snprintf(l0,sizeof(l0),"%-8s FILL",items[cursor].name);
+        snprintf(l1,sizeof(l1),"save %lus",(unsigned long)(ms/1000));
+        lcd.splash(l0,l1,800);
+        step=Step::DONE; return false;
+      }
+      return false;
+    }
+    case Step::DONE:
+    default:{
+      lcd.clear(); renderSelect(true); step=Step::SELECT; return false;
+    }
+  }
+}
+
+static bool PumpTimeoutsWizard() {
+  extern ConfigStore eeprom;
+
+  enum class ItemId : uint8_t { SAMPLE_T, DRAIN_T, ESTAB_T, SAMPLE_CNT, COUNT };
+  struct Item { const char* name; ItemId id; bool isSeconds; };
+
+  static const Item items[] = {
+    { "SAMPLE",  ItemId::SAMPLE_T,  true  },
+    { "DRAIN",   ItemId::DRAIN_T,   true  },
+    { "ESTAB",   ItemId::ESTAB_T,   true  },
+    { "SAMPLES", ItemId::SAMPLE_CNT,false },
+  };
+  static const uint8_t N = (uint8_t)ItemId::COUNT;
+
+  enum class Step : uint8_t { SELECT, EDIT, DONE };
+  static Step     step          = Step::SELECT;
+  static uint8_t  cursor        = 0;
+  static int8_t   lastCursor    = -1;
+  static bool     needFirstDraw = true;
+  static int32_t  editValue     = 0;
+
+  auto clampSecs = [&](int32_t s){ if (s<1) s=1; if (s>600) s=600; return s; };
+  auto clampSamples = [&](int32_t n){ if (n<0) n=0; if (n>4) n=4; return n; };
+
+  auto getSecs = [&](ItemId id)->int32_t {
+    switch(id){
+      case ItemId::SAMPLE_T: return (int32_t)(eeprom.sampleTimeoutMs()/1000UL);
+      case ItemId::DRAIN_T:  return (int32_t)(eeprom.drainTimeoutMs()/1000UL);
+      case ItemId::ESTAB_T:  return (int32_t)(eeprom.stabilizationMs()/1000UL);
+      default: return 0;
+    }
+  };
+  auto setSecs = [&](ItemId id, int32_t s){
+    uint32_t ms = (uint32_t)clampSecs(s)*1000UL;
+    switch(id){
+      case ItemId::SAMPLE_T: eeprom.setSampleTimeoutMs(ms); break;
+      case ItemId::DRAIN_T:  eeprom.setDrainTimeoutMs(ms);  break;
+      case ItemId::ESTAB_T:  eeprom.setStabilizationMs(ms); break;
+      default: break;
+    }
+  };
+  auto getSamples = [&](){ return (int32_t)eeprom.sampleCount(); };
+  auto setSamples = [&](int32_t n){ eeprom.setSampleCount((uint8_t)clampSamples(n)); };
+
+  auto renderSelect = [&](bool force=false){
+    if(force || (int8_t)cursor!=lastCursor){
+      char l0[17], l1[17];
+      snprintf(l0,sizeof(l0),"Timeouts v6");
+      snprintf(l1,sizeof(l1),">%-8s OK>", items[cursor].name);
+      lcd.printAt(0,0,l0); lcd.printAt(0,1,l1);
+      lastCursor=(int8_t)cursor;
+    }
+  };
+  auto renderEdit = [&](){
+    char l0[17]; snprintf(l0,sizeof(l0),"%-8s EDIT",items[cursor].name);
+    char l1[17];
+    if(items[cursor].isSeconds) snprintf(l1,sizeof(l1),"%4lds  OK:save",(long)editValue);
+    else                        snprintf(l1,sizeof(l1),"%4ldx  OK:save",(long)editValue);
+    lcd.printAt(0,0,l0); lcd.printAt(0,1,l1);
+  };
+
+  if(needFirstDraw){
+    lcd.clear(); needFirstDraw=false; lastCursor=-1; step=Step::SELECT;
+    Buttons::BTN_OK.reset(); Buttons::BTN_ESC.reset(); Buttons::BTN_UP.reset(); Buttons::BTN_DOWN.reset();
+    renderSelect(true);
+  }
+
+  if (Buttons::BTN_ESC.value) { Buttons::BTN_ESC.reset(); needFirstDraw=true; return true; }
+
+  switch(step){
+    case Step::SELECT:{
+      if (Buttons::BTN_UP.value){ Buttons::BTN_UP.reset(); cursor=(cursor==0)?(N-1):(cursor-1); renderSelect(true); return false; }
+      if (Buttons::BTN_DOWN.value){ Buttons::BTN_DOWN.reset(); cursor=(cursor+1)%N; renderSelect(true); return false; }
+      if (Buttons::BTN_OK.value){
+        Buttons::BTN_OK.reset();
+        if(items[cursor].isSeconds)
+          editValue = clampSecs(getSecs(items[cursor].id));
+        else
+          editValue = clampSamples(getSamples());
+        lcd.clear(); renderEdit(); step=Step::EDIT; return false;
+      }
+      return false;
+    }
+    case Step::EDIT:{
+      if (Buttons::BTN_UP.value){ Buttons::BTN_UP.reset();
+        editValue = items[cursor].isSeconds ? clampSecs(editValue+1) : clampSamples(editValue+1);
+        renderEdit(); return false; }
+      if (Buttons::BTN_DOWN.value){ Buttons::BTN_DOWN.reset();
+        editValue = items[cursor].isSeconds ? clampSecs(editValue-1) : clampSamples(editValue-1);
+        renderEdit(); return false; }
+
+      if (Buttons::BTN_OK.value){
+        Buttons::BTN_OK.reset();
+        if(items[cursor].isSeconds) setSecs(items[cursor].id, editValue);
+        else                        setSamples(editValue);
+        eeprom.save();
+        char l0[17], l1[17];
+        snprintf(l0,sizeof(l0),"%-8s GUARD",items[cursor].name);
+        if(items[cursor].isSeconds) snprintf(l1,sizeof(l1),"%ld s",(long)editValue);
+        else                        snprintf(l1,sizeof(l1),"%ld bombas",(long)editValue);
+        lcd.splash(l0,l1,700);
+        step=Step::DONE; return false;
+      }
+      if (Buttons::BTN_ESC.value){
+        Buttons::BTN_ESC.reset(); lcd.splash("Sin cambios","",500); step=Step::DONE; return false;
+      }
+      renderEdit(); return false;
+    }
+    case Step::DONE:
+    default:{
+      lcd.clear(); renderSelect(true); step=Step::SELECT; return false;
+    }
+  }
+}
+
+static bool PumpTimesTestWizard() {
+  // extern PumpsManager         pumps;
+  // extern ConfigStore          eeprom;
+  // extern LevelSensorsManager  levels;   // O2/PH/H2O/KCL (pull-up externas, activo en alto)
+
+  // // ---- Timeouts por bomba desde EEPROM ----
+  // auto getTimeoutMs = [&](PumpId id) -> uint32_t {
+  //   switch (id) {
+  //     case PumpId::KCL:      return eeprom.kclTimeoutMs();
+  //     case PumpId::H2O:      return eeprom.h2oTimeoutMs();
+  //     case PumpId::SAMPLE1:
+  //     case PumpId::SAMPLE2:
+  //     case PumpId::SAMPLE3:
+  //     case PumpId::SAMPLE4:  return eeprom.sampleTimeoutMs();
+  //     default:               return 0;
+  //   }
   // };
-  // static const uint8_t N = sizeof(items)/sizeof(items[0]);
 
-  // enum class Step : uint8_t { SELECT, SHOW, RUNNING, DONE };
+  // // ---- Construcción dinámica del menú según sampleCount ----
+  // struct Item { const char* name; PumpId id; };
+
+  // // Máx: KCL, H2O + 4 samples = 6 ítems
+  // static Item items[6];
+  // static uint8_t N = 0;
+
+  // auto rebuildItems = [&](){
+  //   N = 0;
+  //   items[N++] = { "KCL", PumpId::KCL };
+  //   items[N++] = { "H2O", PumpId::H2O };
+
+  //   uint8_t sc = eeprom.sampleCount();      // 1..4 recomendado
+  //   if (sc > 4) sc = 4;                     // tope de seguridad
+
+  //   if (sc >= 1) items[N++] = { "S1", PumpId::SAMPLE1 };
+  //   if (sc >= 2) items[N++] = { "S2", PumpId::SAMPLE2 };
+  //   if (sc >= 3) items[N++] = { "S3", PumpId::SAMPLE3 };
+  //   if (sc >= 4) items[N++] = { "S4", PumpId::SAMPLE4 };
+  // };
+
+  // // ---- FSM ----
+  // enum class Step : uint8_t { SELECT, RUNNING, DONE };
   // static Step step = Step::SELECT;
 
   // static uint8_t  cursor        = 0;
   // static int8_t   lastCursor    = -1;
   // static bool     needFirstDraw = true;
-  // static unsigned long tStart   = 0;
+  // static bool     armed         = false;   // evita auto-arranque por OK previo
+  // static unsigned long tEnd     = 0;
   // static PumpId   selId         = PumpId::KCL;
-  // static bool     selIsStab     = false;
+  // static uint32_t runMs         = 0;
 
   // auto clearLatches = [](){
   //   if (Buttons::BTN_OK.value)   Buttons::BTN_OK.reset();
@@ -644,63 +1162,38 @@ static bool PumpTimesSetWizard() {
   //   if (Buttons::BTN_DOWN.value) Buttons::BTN_DOWN.reset();
   // };
 
-  // auto storeTimeMs = [&](PumpId id, bool isStab, uint32_t ms){
-  //   if (isStab) {
-  //     eeprom.setStabilizationMs(ms);           // <--- guarda tiempo de
-  //     estabilización
-  //   } else {
-  //     switch (id) {
-  //       case PumpId::KCL:    eeprom.setKclFillMs(ms);    break;
-  //       case PumpId::H2O:    eeprom.setH2oFillMs(ms);    break;
-  //       case PumpId::SAMPLE: eeprom.setSampleFillMs(ms); break;
-  //       default: break;
-  //     }
-  //   }
-  //   eeprom.save();
-  // };
-
-  // auto renderSelect = [&](bool force=false){
+  // auto renderSelect = [&](bool force=false) {
   //   if (force || (int8_t)cursor != lastCursor) {
-  //     char l0[17], l1[17];
-  //     snprintf(l0, sizeof(l0), "Set tiempos");
-  //     // Muestra el ítem y pista de acción
-  //     snprintf(l1, sizeof(l1), ">%-6s OK>", items[cursor].name);
+  //     uint32_t ms = getTimeoutMs(items[cursor].id);
+  //     char l0[17]; snprintf(l0, sizeof(l0), "Probar bombeo");
+  //     char l1[17]; snprintf(l1, sizeof(l1), ">%-3s %lus", items[cursor].name,
+  //                           (unsigned long)(ms/1000));
   //     lcd.printAt(0,0, l0);
   //     lcd.printAt(0,1, l1);
   //     lastCursor = (int8_t)cursor;
   //   }
   // };
 
-  // // Pantalla “BOMBEO/ESTAB” antes de iniciar (t=0, espera OK)
-  // auto renderShowWaiting = [&](){
-  //   char l0[17], l1[17];
-  //   if (selIsStab) {
-  //     // enseña el valor actual guardado como referencia
-  //     uint32_t cur = eeprom.stabilizationMs();
-  //     snprintf(l0, sizeof(l0), "ESTAB t0   cur");
-  //     // muestralo en segundos para lectura rápida
-  //     snprintf(l1, sizeof(l1), "%lus  OK:start", (unsigned long)(cur/1000));
-  //   } else {
-  //     snprintf(l0, sizeof(l0), "%-6s BOMBEO", items[cursor].name);
-  //     snprintf(l1, sizeof(l1), "t=0s  OK:start");
-  //   }
+  // auto renderRunning = [&](){
+  //   long rem = (long)(tEnd - millis());
+  //   if (rem < 0) rem = 0;
+  //   char l0[17]; snprintf(l0, sizeof(l0), "%-3s TEST", items[cursor].name);
+  //   char l1[17]; snprintf(l1, sizeof(l1), "rem=%lus ESC:stop", (unsigned long)(rem/1000));
   //   lcd.printAt(0,0, l0);
   //   lcd.printAt(0,1, l1);
   // };
 
-  // // Pantalla corriendo (bomba/mixer encendido)
-  // auto renderRunning = [&](){
-  //   unsigned long secs = (millis() - tStart) / 1000UL;
-  //   char l0[17], l1[17];
-  //   if (selIsStab) {
-  //     snprintf(l0, sizeof(l0), "ESTAB (mixer)");
-  //     snprintf(l1, sizeof(l1), "t=%lus ESC:stop", (unsigned long)secs);
-  //   } else {
-  //     snprintf(l0, sizeof(l0), "%-6s BOMBEO", items[cursor].name);
-  //     snprintf(l1, sizeof(l1), "t=%lus ESC:stop", (unsigned long)secs);
+  // // ---- Paro por sensor (igual que en AutoMode actual) ----
+  // auto shouldStopBySensor = [&](PumpId pump) -> bool {
+  //   switch (pump) {
+  //     case PumpId::KCL:      return levels.kcl();                 // HIGH -> activo
+  //     case PumpId::H2O:      return levels.h2o();                 // HIGH -> activo
+  //     case PumpId::SAMPLE1:
+  //     case PumpId::SAMPLE2:
+  //     case PumpId::SAMPLE3:
+  //     case PumpId::SAMPLE4:  return (!levels.o2() && !levels.ph()); // confirmación doble (mantener corrección)
+  //     default:               return false;
   //   }
-  //   lcd.printAt(0,0, l0);
-  //   lcd.printAt(0,1, l1);
   // };
 
   // if (needFirstDraw) {
@@ -708,96 +1201,75 @@ static bool PumpTimesSetWizard() {
   //   needFirstDraw = false;
   //   lastCursor    = -1;
   //   step          = Step::SELECT;
-  //   tStart        = 0;
-  //   clearLatches();             // evita que un OK previo dispare nada
+  //   armed         = false;
+
+  //   rebuildItems();          // <<-- construir menú según sampleCount
+  //   if (cursor >= N) cursor = 0;
+
   //   renderSelect(true);
   // }
 
   // switch (step) {
   //   case Step::SELECT: {
-  //     if (Buttons::BTN_UP.value)   { Buttons::BTN_UP.reset();   cursor =
-  //     (cursor==0)? (N-1) : (cursor-1); renderSelect(true); return false; } if
-  //     (Buttons::BTN_DOWN.value) { Buttons::BTN_DOWN.reset(); cursor =
-  //     (cursor+1) % N;                   renderSelect(true); return false; }
+  //     // Primera pasada: limpia latches para no entrar corriendo por un OK previo
+  //     if (!armed) {
+  //       clearLatches();
+  //       armed = true;
+  //       return false;
+  //     }
+
+  //     if (Buttons::BTN_UP.value)   { Buttons::BTN_UP.reset();   cursor = (cursor==0)? (N-1) : (cursor-1); renderSelect(true); }
+  //     if (Buttons::BTN_DOWN.value) { Buttons::BTN_DOWN.reset(); cursor = (cursor+1) % N;                  renderSelect(true); }
 
   //     if (Buttons::BTN_OK.value) {
   //       Buttons::BTN_OK.reset();
-  //       selId     = items[cursor].id;
-  //       selIsStab = items[cursor].isStab;
-  //       tStart = 0;                    // aún no inicia cronómetro
-  //       lcd.clear();
-  //       renderShowWaiting();           // muestra “BOMBEO/ESTAB” y t=0s,
-  //       espera OK clearLatches();                // descarta el OK que nos
-  //       trajo aquí step = Step::SHOW; return false;
-  //     }
-
-  //     if (Buttons::BTN_ESC.value) {
-  //       Buttons::BTN_ESC.reset();
-  //       needFirstDraw = true;
-  //       return true;                   // salir al menú anterior
-  //     }
-  //     return false;
-  //   }
-
-  //   case Step::SHOW: {
-  //     // Aún no corre: muestra t=0 y espera confirmación OK
-  //     if (Buttons::BTN_OK.value) {
-  //       Buttons::BTN_OK.reset();
-  //       tStart = millis();
-
-  //       if (selIsStab) {
-  //         // Para estabilización, encendemos el mixer
-  //         pumps.on(PumpId::MIXER);
-  //       } else {
-  //         // Para bombas, encendemos la seleccionada
-  //         pumps.on(selId);
+  //       selId = items[cursor].id;
+  //       runMs = getTimeoutMs(selId);
+  //       if (runMs == 0) {
+  //         lcd.splash("Timeout=0", "Configuralo", 800);
+  //         return false;
   //       }
-
+  //       pumps.on(selId);
+  //       tEnd = millis() + runMs;
   //       lcd.clear();
   //       renderRunning();
   //       step = Step::RUNNING;
   //       return false;
   //     }
+
   //     if (Buttons::BTN_ESC.value) {
   //       Buttons::BTN_ESC.reset();
-  //       // salir sin iniciar
   //       needFirstDraw = true;
-  //       step = Step::SELECT;
   //       return true;
   //     }
-  //     // re-dibujo eventual
-  //     renderShowWaiting();
   //     return false;
   //   }
 
   //   case Step::RUNNING: {
-  //     renderRunning();
-
+  //     // Cancelación manual
   //     if (Buttons::BTN_ESC.value) {
   //       Buttons::BTN_ESC.reset();
-
-  //       // Apagar lo que encendimos
-  //       if (selIsStab) {
-  //         pumps.off(PumpId::MIXER);
-  //       } else {
-  //         pumps.off(selId);
-  //       }
-
-  //       uint32_t ms = (uint32_t)(millis() - tStart);
-  //       storeTimeMs(selId, selIsStab, ms);
-
-  //       char l0[17], l1[17];
-  //       if (selIsStab) {
-  //         snprintf(l0, sizeof(l0), "Tiempo ESTAB");
-  //       } else {
-  //         snprintf(l0, sizeof(l0), "Tiempo bombeo");
-  //       }
-  //       snprintf(l1, sizeof(l1), "Guardado %lus", (unsigned long)(ms/1000));
-  //       lcd.splash(l0, l1, 900);
-
+  //       pumps.off(selId);
+  //       lcd.splash("Prueba cancel", "", 600);
   //       step = Step::DONE;
   //       return false;
   //     }
+
+  //     // Paro por sensor o por timeout
+  //     const bool timeReached   = ((long)(millis() - tEnd) >= 0);
+  //     const bool sensorReached = shouldStopBySensor(selId);
+
+  //     if (timeReached || sensorReached) {
+  //       pumps.off(selId);
+  //       char l0[17], l1[17];
+  //       snprintf(l0, sizeof(l0), "%-3s OK", items[cursor].name);
+  //       snprintf(l1, sizeof(l1), sensorReached ? "Fin: SENS" : "Fin: TIME");
+  //       lcd.splash(l0, l1, 700);
+  //       step = Step::DONE;
+  //       return false;
+  //     }
+
+  //     renderRunning();
   //     return false;
   //   }
 
@@ -808,598 +1280,574 @@ static bool PumpTimesSetWizard() {
   //     return true;
   //   }
   // }
-  return true;
 }
 
-// ============================
-//  BOMBEOS: Probar tiempo guardado
-//  Flujo: elegir bomba -> OK ejecuta por tiempo guardado (auto OFF)
-//         ESC cancela/para y vuelve.
-//  Devuelve true cuando finaliza para volver al menú anterior.
-// ============================
-// static bool PumpTimesTestWizard() {
-//   extern PumpsManager pumps;
-//   extern ConfigStore  eeprom;
-
-//   auto getTimeMs = [&](PumpId id) -> uint32_t {
-//     switch (id) {
-//       case PumpId::KCL:    return eeprom.kclFillMs();
-//       case PumpId::H2O:    return eeprom.h2oFillMs();
-//       case PumpId::SAMPLE: return eeprom.sampleFillMs();
-//       default:             return 0;
-//     }
-//   };
-
-//   struct Item { const char* name; PumpId id; };
-//   static const Item items[] = {
-//     { "KCL",    PumpId::KCL    },
-//     { "H2O",    PumpId::H2O    },
-//     { "SAMPLE", PumpId::SAMPLE },
-//   };
-//   static const uint8_t N = sizeof(items)/sizeof(items[0]);
-
-//   enum class Step : uint8_t { SELECT, RUNNING, DONE };
-//   static Step step = Step::SELECT;
-
-//   static uint8_t  cursor        = 0;
-//   static int8_t   lastCursor    = -1;
-//   static bool     needFirstDraw = true;
-//   static bool     armed         = false;   // <<< NUEVO: requiere
-//   confirmación de OK static unsigned long tEnd     = 0; static PumpId   selId
-//   = PumpId::KCL; static uint32_t runMs         = 0;
-
-//   auto clearLatches = [](){
-//     if (Buttons::BTN_OK.value)   Buttons::BTN_OK.reset();
-//     if (Buttons::BTN_ESC.value)  Buttons::BTN_ESC.reset();
-//     if (Buttons::BTN_UP.value)   Buttons::BTN_UP.reset();
-//     if (Buttons::BTN_DOWN.value) Buttons::BTN_DOWN.reset();
-//   };
-
-//   auto renderSelect = [&](bool force=false) {
-//     if (force || (int8_t)cursor != lastCursor) {
-//       uint32_t ms = getTimeMs(items[cursor].id);
-//       char l0[17]; snprintf(l0, sizeof(l0), "Probar bombeo");
-//       char l1[17]; snprintf(l1, sizeof(l1), ">%-6s %lus", items[cursor].name,
-//       (unsigned long)(ms/1000)); lcd.printAt(0,0, l0); lcd.printAt(0,1, l1);
-//       lastCursor = (int8_t)cursor;
-//     }
-//   };
-
-//   auto renderRunning = [&](){
-//     long rem = (long)(tEnd - millis());
-//     if (rem < 0) rem = 0;
-//     char l0[17]; snprintf(l0, sizeof(l0), "%-6s TEST", items[cursor].name);
-//     char l1[17]; snprintf(l1, sizeof(l1), "rem=%lus ESC:stop", (unsigned
-//     long)(rem/1000)); lcd.printAt(0,0, l0); lcd.printAt(0,1, l1);
-//   };
-
-//   if (needFirstDraw) {
-//     lcd.clear();
-//     needFirstDraw = false;
-//     lastCursor    = -1;
-//     step          = Step::SELECT;
-//     armed         = false;     // <<< desarmado al entrar
-//     renderSelect(true);
-//   }
-
-//   switch (step) {
-//     case Step::SELECT: {
-//       // Primera pasada: limpia latches y arma la pantalla; NO inicia nada.
-//       if (!armed) {
-//         clearLatches();    // <<< ignora el OK que te trajo aquí o un
-//         long-press armed = true; return false;
-//       }
-
-//       if (Buttons::BTN_UP.value)   { Buttons::BTN_UP.reset();   cursor =
-//       (cursor==0)? (N-1) : (cursor-1); renderSelect(true); } if
-//       (Buttons::BTN_DOWN.value) { Buttons::BTN_DOWN.reset(); cursor =
-//       (cursor+1) % N;                   renderSelect(true); }
-
-//       if (Buttons::BTN_OK.value) {
-//         Buttons::BTN_OK.reset();
-//         selId = items[cursor].id;
-//         runMs = getTimeMs(selId);
-//         if (runMs == 0) {
-//           lcd.splash("Tiempo=0", "Configuralo", 800);
-//           return false;
-//         }
-//         pumps.on(selId);
-//         tEnd = millis() + runMs;
-//         lcd.clear();
-//         renderRunning();
-//         step = Step::RUNNING;
-//         return false;
-//       }
-
-//       if (Buttons::BTN_ESC.value) {
-//         Buttons::BTN_ESC.reset();
-//         needFirstDraw = true;
-//         return true;
-//       }
-//       return false;
-//     }
-
-//     case Step::RUNNING: {
-//       if (Buttons::BTN_ESC.value) {
-//         Buttons::BTN_ESC.reset();
-//         pumps.off(selId);
-//         lcd.splash("Prueba cancel", "", 600);
-//         step = Step::DONE;
-//         return false;
-//       }
-
-//       if ((long)(millis() - tEnd) >= 0) {
-//         pumps.off(selId);
-//         lcd.splash("Prueba OK", "", 600);
-//         step = Step::DONE;
-//         return false;
-//       }
-
-//       renderRunning();
-//       return false;
-//     }
-
-//     case Step::DONE:
-//     default: {
-//       needFirstDraw = true;
-//       step = Step::SELECT;
-//       return true;
-//     }
-//   }
-// }
-
-// Selector manual de actuadores (KCL, H2O, SAMPLE, DRAIN, MIXER).
-// Controles: UP/DOWN para seleccionar; OK = encender; ESC = apagar.
-// No usa extern aquí: asume que `lcd`, `pumps` y `Buttons::BTN_*` existen
-// globalmente. Llama esta función cuando estés en la vista "MANUAL" dentro de
-// tu FSM. Devuelve true cuando el usuario quiere salir (ESC con bomba ya
-// apagada)
 static bool ManualPumpsTick() {
-  // struct Item { const char* name; PumpId id; };
-  // static const Item items[] = {
-  //   { "KCL",    PumpId::KCL    },
-  //   { "H2O",    PumpId::H2O    },
-  //   { "SAMPLE", PumpId::SAMPLE },
-  //   { "DRAIN",  PumpId::DRAIN  },
-  //   { "MIXER",  PumpId::MIXER  },  // <- usa PumpId::Mixer si renombraste
-  // };
-  // static const uint8_t N = sizeof(items) / sizeof(items[0]);
+  struct Item { const char* name; PumpId id; };
+  static const Item items[] = {
+    { "KCL",     PumpId::KCL     },
+    { "H2O",     PumpId::H2O     },
+    { "DRAIN",   PumpId::DRAIN   },
+    { "MIXER",   PumpId::MIXER   },
+    { "SAMPLE1", PumpId::SAMPLE1 },
+    { "SAMPLE2", PumpId::SAMPLE2 },
+    { "SAMPLE3", PumpId::SAMPLE3 },
+    { "SAMPLE4", PumpId::SAMPLE4 },
+  };
+  static const uint8_t N = sizeof(items) / sizeof(items[0]);
 
-  // // Estado local persistente
-  // static uint8_t cursor      = 0;
-  // static int8_t  lastCursor  = -1;
-  // static bool    lastState   = false;
-  // static bool    needFirstDraw = true;   // <-- fuerza render al entrar
+  // Estado persistente de la pantalla
+  static uint8_t cursor        = 0;   // índice actual 0..N-1
+  static int8_t  lastCursor    = -1;  // para repintado condicional
+  static bool    lastState     = false;
+  static bool    needFirstDraw = true;
 
-  // auto render = [&](bool force=false) {
-  //   bool st = pumps.isOn(items[cursor].id);
-  //   if (force || (int8_t)cursor != lastCursor || st != lastState) {
-  //     char l0[17];
-  //     snprintf(l0, sizeof(l0), "%-10s %s", items[cursor].name, st ? "ON " :
-  //     "OFF"); lcd.printAt(0,0, l0); lcd.printAt(0,1, "OK:on ESC:off");
-  //     lastCursor = (int8_t)cursor;
-  //     lastState  = st;
-  //   }
-  // };
+  auto render = [&](bool force=false) {
+    const bool st = pumps.isOn(items[cursor].id);
+    if (force || (int8_t)cursor != lastCursor || st != lastState) {
+      char l0[17];
+      snprintf(l0, sizeof(l0), "%-10s %s", items[cursor].name, st ? "ON " : "OFF");
+      lcd.printAt(0, 0, l0);
+      lcd.printAt(0, 1, "OK:on  ESC:off");
+      lastCursor = (int8_t)cursor;
+      lastState  = st;
+    }
+  };
 
-  // // Si venimos de fuera, limpia y fuerza el primer pintado
-  // if (needFirstDraw) {
-  //   lcd.clear();
-  //   needFirstDraw = false;
-  //   render(true);
-  // } else {
-  //   // Si no hay cambios, asegura que al menos una vez dibujamos
-  //   if (lastCursor < 0) render(true);
-  // }
+  // Primer pintado al entrar
+  if (needFirstDraw) {
+    lcd.clear();
+    needFirstDraw = false;
+    render(true);
+  } else if (lastCursor < 0) {
+    // Asegura al menos un render
+    render(true);
+  }
 
-  // // Botones latcheados (ya actualizados por el menú principal)
-  // if (Buttons::BTN_UP.value) {
-  //   Buttons::BTN_UP.reset();
-  //   cursor = (cursor == 0) ? (N - 1) : (cursor - 1);
-  //   render(true);
-  //   return false;
-  // }
-  // if (Buttons::BTN_DOWN.value) {
-  //   Buttons::BTN_DOWN.reset();
-  //   cursor = (cursor + 1) % N;
-  //   render(true);
-  //   return false;
-  // }
-  // if (Buttons::BTN_OK.value) {
-  //   Buttons::BTN_OK.reset();
-  //   pumps.on(items[cursor].id);   // encender
-  //   render(true);
-  //   return false;
-  // }
-  // if (Buttons::BTN_ESC.value) {
-  //   Buttons::BTN_ESC.reset();
-  //   // si está ON -> apaga y permanece; si ya está OFF -> salir
-  //   if (pumps.isOn(items[cursor].id)) {
-  //     pumps.off(items[cursor].id);
-  //     render(true);
-  //     return false;
-  //   } else {
-  //     // ya estaba apagada: salir al menú anterior
-  //     needFirstDraw = true;       // <-- prepara primer render para próxima
-  //     entrada return true;
-  //   }
-  // }
+  // Navegación
+  if (Buttons::BTN_UP.value) {
+    Buttons::BTN_UP.reset();
+    cursor = (cursor == 0) ? (N - 1) : (cursor - 1);
+    render(true);
+    return false;
+  }
+  if (Buttons::BTN_DOWN.value) {
+    Buttons::BTN_DOWN.reset();
+    cursor = (cursor + 1) % N;
+    render(true);
+    return false;
+  }
 
-  return false; // continuar en manual
-}
-
-// Muestra estado de sensores de nivel (H2O/KCL) y sale con ESC.
-// Devuelve true cuando se debe volver al menú anterior.
-static bool ManualLevelsTick() {
-  // // estado persistente local
-  // static bool needFirstDraw = true;
-  // static int8_t lastH2O = -1;  // -1 = desconocido, 0 = LOW, 1 = HIGH
-  // static int8_t lastKCL = -1;
-
-  // auto readAndRender = [&](bool force=false) {
-  //   bool h2o = pumps.levelH2O();   // true si pin está HIGH (ajusta lógica
-  //   según hardware) bool kcl = pumps.levelKCL();
-
-  //   int8_t h2o_i = h2o ? 0 : 1;
-  //   int8_t kcl_i = kcl ? 0 : 1;
-
-  //   if (force || h2o_i != lastH2O || kcl_i != lastKCL) {
-  //     char l0[17], l1[17];
-  //     snprintf(l0, sizeof(l0), "Nivel H2O:%s", h2o ? "BAJO" : "OK");
-  //     snprintf(l1, sizeof(l1), "Nivel KCL:%s", kcl ? "BAJO" : "OK");
-  //     lcd.printAt(0,0, l0);
-  //     lcd.printAt(0,1, l1);
-  //     lastH2O = h2o_i;
-  //     lastKCL = kcl_i;
-  //   }
-  // };
-
-  // if (needFirstDraw) {
-  //   lcd.clear();
-  //   needFirstDraw = false;
-  //   readAndRender(true);
-  // } else {
-  //   // refresco oportunista si cambia el estado
-  //   readAndRender(false);
-  // }
-
-  // // Controles: ESC = volver, OK = refrescar manual
-  // if (Buttons::BTN_ESC.value) {
-  //   Buttons::BTN_ESC.reset();
-  //   needFirstDraw = true;   // fuerza redraw en próxima entrada
-  //   return true;            // salir a menú anterior
-  // }
-  // if (Buttons::BTN_OK.value) {
-  //   Buttons::BTN_OK.reset();
-  //   readAndRender(true);
-  // }
-  // if (Buttons::BTN_UP.value)   Buttons::BTN_UP.reset();   // sin acción
-  // if (Buttons::BTN_DOWN.value) Buttons::BTN_DOWN.reset(); // sin acción
+  // Acciones
+  if (Buttons::BTN_OK.value) {
+    Buttons::BTN_OK.reset();
+    pumps.on(items[cursor].id);     // ENCENDER
+    render(true);
+    return false;
+  }
+  if (Buttons::BTN_ESC.value) {
+    Buttons::BTN_ESC.reset();
+    if (pumps.isOn(items[cursor].id)) {
+      pumps.off(items[cursor].id);  // APAGAR y quedarse
+      render(true);
+      return false;
+    } else {
+      // Ya estaba OFF → salir al menú anterior
+      needFirstDraw = true;         // fuerza primer render al reingresar
+      return true;
+    }
+  }
 
   return false; // permanecer en esta pantalla
 }
 
-// ---------- MODO AUTOMÁTICO MODULAR (no bloqueante) ----------
-// Inicia SOLO si ambos niveles están OK. Tras cada paso, muestra "OK" 2s.
+static bool ManualLevelsTick() {
+  // Estado persistente local
+  static bool  needFirstDraw = true;
+  static int8_t lastO2  = -1;  // -1 = desconocido, 0 = LOW, 1 = HIGH
+  static int8_t lastPH  = -1;
+  static int8_t lastKCL = -1;
+  static int8_t lastH2O = -1;
+
+  auto readAndRender = [&](bool force = false) {
+    // Activo = HIGH (pull-ups externas). Mantenemos convención "BAJO" cuando está activo.
+    const bool o2  = levels.o2();   // true → activo → "BAJO"
+    const bool ph  = levels.ph();
+    const bool kcl = levels.kcl();
+    const bool h2o = levels.h2o();
+
+    // Codificamos en 0/1 para comparar cambios
+    const int8_t o2_i  = o2  ? 1 : 0;
+    const int8_t ph_i  = ph  ? 1 : 0;
+    const int8_t kcl_i = kcl ? 1 : 0;
+    const int8_t h2o_i = h2o ? 1 : 0;
+
+    const bool changed =
+      (o2_i  != lastO2)  ||
+      (ph_i  != lastPH)  ||
+      (kcl_i != lastKCL) ||
+      (h2o_i != lastH2O);
+
+    if (force || changed) {
+      // Formato compacto para 16x2:
+      // L0: "O2:XXX  pH:XXX"
+      // L1: "H2O:XXX KCL:XXX"
+      const char* sO2  = o2  ? "LOW" : "OK ";
+      const char* sPH  = ph  ? "LOW" : "OK ";
+      const char* sH2O = h2o ? "LOW" : "OK ";
+      const char* sKCL = kcl ? "LOW" : "OK ";
+
+      char l0[17], l1[17];
+      snprintf(l0, sizeof(l0), "O2:%s  pH:%s",  sO2,  sPH);
+      snprintf(l1, sizeof(l1), "H2O:%s KCL:%s", sH2O, sKCL);
+
+      lcd.printAt(0, 0, l0);
+      lcd.printAt(0, 1, l1);
+
+      lastO2  = o2_i;
+      lastPH  = ph_i;
+      lastKCL = kcl_i;
+      lastH2O = h2o_i;
+    }
+  };
+
+  // Primer pintado al entrar
+  if (needFirstDraw) {
+    lcd.clear();
+    needFirstDraw = false;
+    readAndRender(true);
+  } else {
+    // refresco oportunista si cambia el estado
+    readAndRender(false);
+  }
+
+  // Controles
+  if (Buttons::BTN_ESC.value) {
+    Buttons::BTN_ESC.reset();
+    needFirstDraw = true;   // fuerza redraw al regresar a esta pantalla
+    return true;            // salir al menú anterior
+  }
+  if (Buttons::BTN_OK.value) {
+    Buttons::BTN_OK.reset();
+    readAndRender(true);    // refresco manual
+  }
+  if (Buttons::BTN_UP.value)   Buttons::BTN_UP.reset();   // sin acción
+  if (Buttons::BTN_DOWN.value) Buttons::BTN_DOWN.reset(); // sin acción
+
+  return false; // permanecer en esta pantalla
+}
+
 static bool AutoModeTick() {
-  //   // Dependencias externas existentes
-  //   extern PumpsManager pumps;
-  //   extern ConfigStore  eeprom;
-  //   extern float readPH();
-  //   extern float readThermo();
+  extern PumpsManager           pumps;
+  extern ConfigStore            eeprom;
+  extern LevelSensorsManager    levels;     // O2/PH/KCL/H2O (pull-up externas, activo=HIGH)
+  extern float                  readPH();
+  extern float                  readThermo();
+  extern UartProto::UARTManager uart2;      // para registrar pH por sample
 
-  //   // ---------- Declaraciones de tipos de paso ----------
-  //   enum class Op : uint8_t {
-  //     READ_LEVELS,
-  //     PUMP_FOR,      // Enciende bomba 'pump' durante 'dur' ms y luego apaga
-  //     MIXER_ON,
-  //     MIXER_OFF,
-  //     WAIT,          // Espera 'dur' ms
-  //     READ_PH,
-  //     END
-  //   };
+  // ---------- Tipos de paso ----------
+  enum class Op : uint8_t {
+    READ_LEVELS,
+    PUMP_FOR,        // 1) espera sensor (con/ sin timeout)  2) mantiene FILL  3) continúa
+    MIXER_ON,
+    MIXER_OFF,
+    WAIT,
+    READ_PH,
+    END
+  };
 
-  //   enum class DurKind : uint8_t {
-  //     CONST,         // usar 'ms' del step
-  //     KCL, H2O, SAMPLE,
-  //     DRAIN_2X_SUM,  // 2 * (kcl + h2o)
-  //     MIX_WAIT_VAR   // variable local (mixWaitMs)
-  //   };
+  enum class DurKind : uint8_t {
+    CONST,           // usa Step.ms
+    SAMPLE_T,        // timeout de SAMPLE (fase 1)
+    DRAIN_T,         // timeout de DRAIN  (fase 1)
+    MIX_WAIT_VAR     // estabilización configurable
+  };
 
-  //   struct Step {
-  //     Op        op;
-  //     PumpId    pump;      // solo aplica a PUMP_FOR
-  //     DurKind   dkind;     // cómo calcular duración
-  //     uint32_t  ms;        // si dkind==CONST
-  //     const char* label;   // texto base para LCD/log
-  //   };
+  struct Step {
+    Op          op;
+    PumpId      pump;      // SAMPLE es placeholder (se resuelve por ciclo)
+    DurKind     dkind;
+    uint32_t    ms;        // sólo si dkind==CONST
+    const char* label;
+  };
 
-  //   // ---------- Variable local configurable ----------
-  //   static uint32_t mixWaitMs = 30000;  // 30 s por defecto
-  //   mixWaitMs = eeprom.stabilizationMs();
-  //   static const int displayEndMesgMs = 3000;
+  // ---------- Tiempos ----------
+  static uint32_t mixWaitMs = 30000;            // fallback
+  mixWaitMs = eeprom.stabilizationMs();
+  static const uint32_t MSG_MS = 1500;
 
-  //   // Helpers para tiempos desde EEPROM
-  //   auto getKclMs    = [&](){ return eeprom.kclFillMs();    };
-  //   auto getH2oMs    = [&](){ return eeprom.h2oFillMs();    };
-  //   auto getSampleMs = [&](){ return eeprom.sampleFillMs(); };
+  // Timeouts (fase 1: esperar sensor)
+  auto getSampleTimeoutMs = [&](){ return eeprom.sampleTimeoutMs(); };
+  auto getDrainTimeoutMs  = [&](){ return eeprom.drainTimeoutMs();  };
 
-  //   auto computeDurMs = [&](DurKind dk) -> uint32_t {
-  //     switch (dk) {
-  //       case DurKind::CONST:        return 0; // el caller usará 'ms' del
-  //       step case DurKind::KCL:          return getKclMs(); case
-  //       DurKind::H2O:          return getH2oMs(); case DurKind::SAMPLE:
-  //       return getSampleMs(); case DurKind::DRAIN_2X_SUM: return (getKclMs()
-  //       + getH2oMs() + getSampleMs()) * 1.3; case DurKind::MIX_WAIT_VAR:
-  //       return mixWaitMs; default: return 0;
-  //     }
-  //   };
+  auto computeTimeoutMs = [&](DurKind dk) -> uint32_t {
+    switch (dk) {
+      case DurKind::SAMPLE_T:     return getSampleTimeoutMs();
+      case DurKind::DRAIN_T:      return getDrainTimeoutMs();
+      case DurKind::MIX_WAIT_VAR: return mixWaitMs;
+      case DurKind::CONST:        return 0;
+      default:                    return 0;
+    }
+  };
 
-  //   // ---------- Secuencia de pasos (editable) ----------
-  //   static const Step STEPS[] = {
-  //     { Op::READ_LEVELS, PumpId::KCL,    DurKind::CONST,       0, "Lee
-  //     niveles" }, { Op::PUMP_FOR,    PumpId::DRAIN,  DurKind::DRAIN_2X_SUM,0,
-  //     "Drenando"    }, { Op::PUMP_FOR,    PumpId::SAMPLE, DurKind::SAMPLE, 0,
-  //     "Sample"      }, { Op::MIXER_ON,    PumpId::MIXER,  DurKind::CONST, 0,
-  //     "Mixer ON"    }, { Op::WAIT,        PumpId::MIXER,
-  //     DurKind::MIX_WAIT_VAR,0, "Mezclando"   }, { Op::MIXER_OFF,
-  //     PumpId::MIXER,  DurKind::CONST,       0, "Mixer OFF"   }, {
-  //     Op::READ_PH,     PumpId::MIXER,  DurKind::CONST,       0, "Leer pH" },
-  //     { Op::PUMP_FOR,    PumpId::DRAIN,  DurKind::DRAIN_2X_SUM,0, "Drenando"
-  //     }, { Op::PUMP_FOR,    PumpId::H2O,    DurKind::H2O,         0, "H2O" },
-  //     { Op::PUMP_FOR,    PumpId::KCL,    DurKind::KCL,         0, "KCL" }, {
-  //     Op::END,         PumpId::KCL,    DurKind::CONST,       0, "FIN" },
-  //   };
-  //   static const uint8_t N_STEPS = sizeof(STEPS)/sizeof(STEPS[0]);
+  // Fill (fase 2: mantener encendida)
+  auto getKclFillMs    = [&](){ return eeprom.kclFillMs();    };
+  auto getH2oFillMs    = [&](){ return eeprom.h2oFillMs();    };
+  auto getSampleFillMs = [&](){ return eeprom.sampleFillMs(); };
+  auto getDrainMs      = [&](){ return eeprom.drainMs();      };
 
-  //   // ---------- Estado interno del motor ----------
-  //   enum class Phase : uint8_t { ENTER, RUN, POST, EXIT };
-  //   static bool     started      = false;   // arranque del proceso
-  //   static uint8_t  idx          = 0;
-  //   static Phase    phase        = Phase::ENTER;
-  //   static uint32_t curDur       = 0;
-  //   static unsigned long t0      = 0;       // inicio de RUN
-  //   static unsigned long tPost   = 0;       // inicio de POST (hold de 2s)
-  //   static float     lastPHShown = NAN;
+  auto computeFillMs = [&](PumpId id) -> uint32_t {
+    switch (id) {
+      case PumpId::KCL:     return getKclFillMs();
+      case PumpId::H2O:     return getH2oFillMs();
+      case PumpId::SAMPLE1:
+      case PumpId::SAMPLE2:
+      case PumpId::SAMPLE3:
+      case PumpId::SAMPLE4: return getSampleFillMs();
+      case PumpId::DRAIN:   return getDrainMs();
+      default:              return 0;
+    }
+  };
 
-  //   // Para espera previa por niveles OK
-  //   static int8_t lastH2O = -1; // -1 desconocido, 0=OK, 1=BAJO
-  //   static int8_t lastKCL = -1;
+  // ---------- Receta ----------
+  static const Step STEPS[] = {
+    { Op::READ_LEVELS, PumpId::KCL,     DurKind::CONST,        0, "Lee niveles" },
+    { Op::PUMP_FOR,    PumpId::DRAIN,   DurKind::DRAIN_T,      0, "Drenando"    },
+    { Op::PUMP_FOR,    PumpId::SAMPLE1, DurKind::SAMPLE_T,     0, "Sample"      }, // SAMPLE dinámico
+    { Op::MIXER_ON,    PumpId::MIXER,   DurKind::CONST,        0, "Mixer ON"    },
+    { Op::WAIT,        PumpId::MIXER,   DurKind::MIX_WAIT_VAR, 0, "Mezclando"   },
+    { Op::MIXER_OFF,   PumpId::MIXER,   DurKind::CONST,        0, "Mixer OFF"   },
+    { Op::READ_PH,     PumpId::MIXER,   DurKind::CONST,        0, "Leer pH"     },
+    { Op::PUMP_FOR,    PumpId::DRAIN,   DurKind::DRAIN_T,      0, "Drenando"    },
+    // H2O/KCL SIN TIMEOUTS (v6): esperar sensor sin límite y luego respetar fill time
+    { Op::PUMP_FOR,    PumpId::H2O,     DurKind::CONST,        0, "H2O"         },
+    { Op::PUMP_FOR,    PumpId::KCL,     DurKind::CONST,        0, "KCL"         },
+    { Op::END,         PumpId::KCL,     DurKind::CONST,        0, "FIN"         },
+  };
+  static const uint8_t N_STEPS = sizeof(STEPS)/sizeof(STEPS[0]);
 
-  //   // ---------- UI helpers ----------
-  //   auto show = [&](const char* l0, const char* l1){
-  //     lcd.printAt(0,0, l0);
-  //     lcd.printAt(0,1, l1);
-  //   };
-  //   auto progressSec = [&](const char* title){
-  //     unsigned long secs = (millis() - t0) / 1000UL;
-  //     char L0[17], L1[17];
-  //     snprintf(L0, sizeof(L0), "%s", title);
-  //     unsigned long tot = (curDur > 0) ? (curDur/1000UL) : 0;
-  //     snprintf(L1, sizeof(L1), "t=%lus/%lus", secs, tot);
-  //     show(L0, L1);
-  //   };
+  // ---------- Estado ----------
+  enum class Phase   : uint8_t { ENTER, RUN, POST, EXIT };
+  enum class PumpSub : uint8_t { WAIT_SENSOR, FILL, DONE };
 
-  //   // ---------- ESC cancela todo ----------
-  //   if (Buttons::BTN_ESC.value) {
-  //     Buttons::BTN_ESC.reset();
-  //     pumps.allOff();
-  //     lcd.splash("AUTO cancelado","", 800);
-  //     started = false; idx = 0; phase = Phase::ENTER; lastPHShown = NAN;
-  //     lastH2O = lastKCL = -1;
-  //     return true;
-  //   }
+  static bool          started      = false;
+  static uint8_t       idx          = 0;
+  static Phase         phase        = Phase::ENTER;
+  static PumpSub       pumpSub      = PumpSub::WAIT_SENSOR;
 
-  //   // ---------- Espera previa: ambos niveles deben estar OK ----------
-  // // ---------- Espera previa: ambos niveles deben estar OK ----------
-  // if (!started) {
-  //   bool h2o_raw = pumps.levelH2O();   // true = BAJO
-  //   bool kcl_raw = pumps.levelKCL();   // true = BAJO
-  //   int8_t h2o_i = h2o_raw ? 1 : 0;    // 1=BAJO, 0=OK
-  //   int8_t kcl_i = kcl_raw ? 1 : 0;
+  static uint32_t      timeoutMs    = 0;      // fase 1
+  static uint32_t      fillMs       = 0;      // fase 2
+  static unsigned long t0           = 0;      // inicio WAIT_SENSOR
+  static unsigned long tFillStart   = 0;      // inicio FILL
+  static unsigned long tPost        = 0;
+  static float         lastPHShown  = NAN;
 
-  //   if (h2o_i != lastH2O || kcl_i != lastKCL || lastH2O < 0 || lastKCL < 0) {
-  //     char l0[17], l1[17];
-  //     snprintf(l0, sizeof(l0), "Nivel H2O:%s", h2o_raw ? "BAJO" : "OK");
-  //     snprintf(l1, sizeof(l1), "Nivel KCL:%s", kcl_raw ? "BAJO" : "OK");
-  //     show(l0, l1);
-  //     lastH2O = h2o_i;
-  //     lastKCL = kcl_i;
-  //   }
+  // iteraciones por nº de samples
+  static uint8_t totalSamples = 0;   // EEPROM
+  static uint8_t currentSample = 0;  // 0..totalSamples-1
 
-  //   // *** NUEVO: permitir cancelar con ESC mientras esperamos niveles OK ***
-  //   if (Buttons::BTN_ESC.value) {
-  //     Buttons::BTN_ESC.reset();
-  //     pumps.allOff();
-  //     lcd.splash("AUTO cancelado","", 800);
-  //     started = false; idx = 0; phase = Phase::ENTER; lastPHShown = NAN;
-  //     lastH2O = lastKCL = -1;
-  //     return true;    // <- salir del modo auto
-  //   }
+  // ---------- UI ----------
+  auto show = [&](const char* l0, const char* l1) {
+    lcd.printAt(0, 0, l0);
+    lcd.printAt(0, 1, l1);
+  };
+  auto progressSec = [&](const char* title, uint32_t totalMs, unsigned long tStart) {
+    unsigned long secs = (millis() - tStart) / 1000UL;
+    char L0[17], L1[17];
+    snprintf(L0, sizeof(L0), "%s", title);
+    unsigned long tot = (totalMs > 0) ? (totalMs / 1000UL) : 0;
+    snprintf(L1, sizeof(L1), "t=%lus/%lus", secs, tot);
+    show(L0, L1);
+  };
 
-  //   // Si alguno está BAJO, no iniciamos aún
-  //   if (h2o_raw || kcl_raw) {
-  //     return false; // seguir esperando; ESC disponible para cancelar
-  //   }
+  // SAMPLE dinámico por ciclo
+  auto samplePumpForCycle = [&]() -> PumpId {
+    uint8_t n = totalSamples;
+    if (n == 0) n = 1;
+    uint8_t i = (currentSample % n);
+    switch (i) {
+      case 0:  return PumpId::SAMPLE1;
+      case 1:  return PumpId::SAMPLE2;
+      case 2:  return PumpId::SAMPLE3;
+      default: return PumpId::SAMPLE4;
+    }
+  };
 
-  //   // Ambos OK -> iniciar ahora
-  //   pumps.allOff();
-  //   lcd.splash("Niveles OK","Iniciando...", 500);
-  //   started      = true;
-  //   idx          = 0;
-  //   phase        = Phase::ENTER;
-  //   curDur       = 0;
-  //   lastPHShown  = NAN;
-  // }
+  // ---------- ESC cancela ----------
+  if (Buttons::BTN_ESC.value) {
+    Buttons::BTN_ESC.reset();
+    pumps.allOff();
+    lcd.splash("AUTO cancelado", "", 800);
+    started = false; idx = 0; phase = Phase::ENTER; lastPHShown = NAN;
+    currentSample = 0; totalSamples = 0;
+    return true;
+  }
 
-  //   // ---------- Ejecución de la receta ----------
-  //   const Step& S = STEPS[idx];
+  // ---------- Precondición: H2O y KCL en OK (LOW) ----------
+  if (!started) {
+    const bool h2o = levels.h2o();  // HIGH=activo
+    const bool kcl = levels.kcl();  // HIGH=activo
+    if (h2o || kcl) {
+      const char* sH2O = h2o ? "ACT" : "OK ";
+      const char* sKCL = kcl ? "ACT" : "OK ";
+      const char* sO2  = levels.o2() ? "ACT" : "OK ";
+      const char* sPH  = levels.ph() ? "ACT" : "OK ";
+      char L0[17], L1[17];
+      snprintf(L0, sizeof(L0), "H2O:%s KCL:%s", sH2O, sKCL);
+      snprintf(L1, sizeof(L1), "O2:%s  pH:%s",  sO2,  sPH);
+      show(L0, L1);
+      return false;
+    }
 
-  //   switch (S.op) {
-  //     case Op::READ_LEVELS: {
-  //       if (phase == Phase::ENTER) {
-  //         bool h2o = pumps.levelH2O();
-  //         bool kcl = pumps.levelKCL();
-  //         char L0[17], L1[17];
-  //         snprintf(L0, sizeof(L0), "Nivel H2O:%s", h2o ? "BAJO" : "OK");
-  //         snprintf(L1, sizeof(L1), "Nivel KCL:%s", kcl ? "BAJO" : "OK");
-  //         show(L0, L1);
-  //         tPost = millis();
-  //         phase = Phase::POST;
-  //       }
-  //       else if (phase == Phase::POST) {
-  //         if (millis() - tPost >= displayEndMesgMs) phase = Phase::EXIT;
-  //       }
-  //       else if (phase == Phase::EXIT) {
-  //         idx++; phase = Phase::ENTER;
-  //       }
-  //     } break;
+    totalSamples  = eeprom.sampleCount();     // 0..4
+    if (totalSamples == 0) totalSamples = 1;
+    currentSample = 0;
 
-  //     case Op::PUMP_FOR: {
-  //       if (phase == Phase::ENTER) {
-  //         curDur = (S.dkind == DurKind::CONST) ? S.ms :
-  //         computeDurMs(S.dkind); if (curDur == 0) curDur = 500; // mínimo
-  //         pumps.on(S.pump);
-  //         t0 = millis();
-  //         phase = Phase::RUN;
-  //         progressSec(S.label);
-  //       }
-  //       else if (phase == Phase::RUN) {
-  //         progressSec(S.label);
-  //         if ((millis() - t0) >= curDur) {
-  //           pumps.off(S.pump);
-  //           char L0[17], L1[17];
-  //           snprintf(L0, sizeof(L0), "%s", S.label);
-  //           snprintf(L1, sizeof(L1), "OK");
-  //           show(L0, L1);
-  //           tPost = millis();
-  //           phase = Phase::POST;
-  //         }
-  //       }
-  //       else if (phase == Phase::POST) {
-  //         if (millis() - tPost >= displayEndMesgMs) phase = Phase::EXIT;
-  //       }
-  //       else if (phase == Phase::EXIT) {
-  //         idx++; phase = Phase::ENTER;
-  //       }
-  //     } break;
+    pumps.allOff();
+    lcd.splash("Niveles OK", "Iniciando...", 500);
+    started     = true;
+    idx         = 0;
+    phase       = Phase::ENTER;
+    lastPHShown = NAN;
+  }
 
-  //     case Op::MIXER_ON: {
-  //       if (phase == Phase::ENTER) {
-  //         pumps.on(PumpId::MIXER);
-  //         show("Mixer ON","OK");
-  //         tPost = millis();
-  //         phase = Phase::POST;
-  //       }
-  //       else if (phase == Phase::POST) {
-  //         if (millis() - tPost >= displayEndMesgMs) phase = Phase::EXIT;
-  //       }
-  //       else if (phase == Phase::EXIT) {
-  //         idx++; phase = Phase::ENTER;
-  //       }
-  //     } break;
+  // ---------- Sensor alcanzado? (según requerimiento) ----------
+  auto sensorReached = [&](PumpId pump) -> bool {
+    switch (pump) {
+      case PumpId::KCL:     return levels.kcl();                    // activo=HIGH
+      case PumpId::H2O:     return levels.h2o();                    // activo=HIGH
+      case PumpId::SAMPLE1:
+      case PumpId::SAMPLE2:
+      case PumpId::SAMPLE3:
+      case PumpId::SAMPLE4: return (!levels.o2() && !levels.ph());    // ambos ACTIVOS
+      case PumpId::DRAIN:   return (levels.o2() && levels.ph());  // ambos INACTIVOS
+      default:              return false;
+    }
+  };
 
-  //     case Op::MIXER_OFF: {
-  //       if (phase == Phase::ENTER) {
-  //         pumps.off(PumpId::MIXER);
-  //         show("Mixer OFF","OK");
-  //         tPost = millis();
-  //         phase = Phase::POST;
-  //       }
-  //       else if (phase == Phase::POST) {
-  //         if (millis() - tPost >= displayEndMesgMs) phase = Phase::EXIT;
-  //       }
-  //       else if (phase == Phase::EXIT) {
-  //         idx++; phase = Phase::ENTER;
-  //       }
-  //     } break;
+  // ---------- Paso actual ----------
+  const Step& S = STEPS[idx];
 
-  //     case Op::WAIT: {
-  //       if (phase == Phase::ENTER) {
-  //         curDur = (S.dkind == DurKind::CONST) ? S.ms :
-  //         computeDurMs(S.dkind); t0 = millis(); phase = Phase::RUN;
-  //         progressSec(S.label);
-  //       }
-  //       else if (phase == Phase::RUN) {
-  //         progressSec(S.label);
-  //         if ((millis() - t0) >= curDur) {
-  //           char L0[17], L1[17];
-  //           snprintf(L0, sizeof(L0), "%s", S.label);
-  //           snprintf(L1, sizeof(L1), "OK");
-  //           show(L0, L1);
-  //           tPost = millis();
-  //           phase = Phase::POST;
-  //         }
-  //       }
-  //       else if (phase == Phase::POST) {
-  //         if (millis() - tPost >= displayEndMesgMs) phase = Phase::EXIT;
-  //       }
-  //       else if (phase == Phase::EXIT) {
-  //         idx++; phase = Phase::ENTER;
-  //       }
-  //     } break;
+  switch (S.op) {
+    case Op::READ_LEVELS: {
+      if (phase == Phase::ENTER) {
+        const bool h2o = levels.h2o();
+        const bool kcl = levels.kcl();
+        const bool o2  = levels.o2();
+        const bool ph  = levels.ph();
+        const char* sH2O = h2o ? "ACT" : "OK ";
+        const char* sKCL = kcl ? "ACT" : "OK ";
+        const char* sO2  = o2  ? "ACT" : "OK ";
+        const char* sPH  = ph  ? "ACT" : "OK ";
+        char L0[17], L1[17];
+        snprintf(L0, sizeof(L0), "H2O:%s KCL:%s", sH2O, sKCL);
+        snprintf(L1, sizeof(L1), "O2:%s  pH:%s",  sO2,  sPH);
+        show(L0, L1);
+        tPost = millis();
+        phase = Phase::POST;
+      } else if (phase == Phase::POST) {
+        if (millis() - tPost >= MSG_MS) phase = Phase::EXIT;
+      } else if (phase == Phase::EXIT) {
+        idx++; phase = Phase::ENTER;
+      }
+    } break;
 
-  //     case Op::READ_PH: {
-  //       if (phase == Phase::ENTER) {
-  //         char L0[17], L1[17];
-  //         snprintf(L0, sizeof(L0), "Leyendo pH");
-  //         snprintf(L1, sizeof(L1), " ");
-  //         show(L0, L1);
-  //         float ph = readPH();
-  //         lastPHShown = ph;
-  //         snprintf(L0, sizeof(L0), "pH: %.02f", ph);
-  //         snprintf(L1, sizeof(L1), "OK");
-  //         show(L0, L1);
-  //         tPost = millis();
-  //         phase = Phase::POST;
-  //       }
-  //       else if (phase == Phase::POST) {
-  //         if (millis() - tPost >= displayEndMesgMs) phase = Phase::EXIT;
-  //       }
-  //       else if (phase == Phase::EXIT) {
-  //         idx++; phase = Phase::ENTER;
-  //       }
-  //     } break;
+    case Op::PUMP_FOR: {
+      // Resolver SAMPLE dinámico
+      PumpId effPump = (S.pump == PumpId::SAMPLE1) ? samplePumpForCycle() : S.pump;
 
-  //     case Op::END: {
-  //       pumps.allOff();
-  //       lcd.splash("AUTO","Completado", 900);
-  //       started = false; idx = 0; phase = Phase::ENTER; lastPHShown = NAN;
-  //       lastH2O = lastKCL = -1;
-  //       return true;
-  //     }
+      if (phase == Phase::ENTER) {
+        timeoutMs = computeTimeoutMs(S.dkind);   // 0 para CONST -> sin timeout
+        fillMs    = computeFillMs(effPump);
+        if (fillMs == 0) fillMs = 500;          // mínimo seguridad
 
-  //     default: {
-  //       // Failsafe
-  //       pumps.allOff();
-  //       lcd.splash("AUTO","Error step", 800);
-  //       started = false; idx = 0; phase = Phase::ENTER; lastPHShown = NAN;
-  //       lastH2O = lastKCL = -1;
-  //       return true;
-  //     }
-  //   }
+        pumps.on(effPump);
+        pumpSub   = PumpSub::WAIT_SENSOR;
+        t0        = millis();
+        show(S.label, "Esperando sens");
+        phase     = Phase::RUN;
+      }
+      else if (phase == Phase::RUN) {
+        if (pumpSub == PumpSub::WAIT_SENSOR) {
+          bool reached = sensorReached(effPump);
+          bool to_exp  = (timeoutMs > 0) && ((millis() - t0) >= timeoutMs);
 
-  return false; // seguir en automático
+          if (reached) {
+            pumpSub    = PumpSub::FILL;
+            tFillStart = millis();
+
+            // DRAIN: tras alcanzar INACTIVOS, ahora drena por drainMs()
+            // SAMPLE: tras alcanzar ACTIVOS, ahora llena por sampleFillMs()
+            progressSec(S.label, fillMs, tFillStart);
+          } else if (to_exp) {
+            pumps.off(effPump);
+            lcd.splash("AUTO STOP", "Timeout sensor", 900);
+            started = false; idx = 0; phase = Phase::ENTER; lastPHShown = NAN;
+            currentSample = 0; totalSamples = 0;
+            return true;
+          } else {
+            // Mostrar progreso contra timeout si aplica
+            if (timeoutMs > 0) progressSec(S.label, timeoutMs, t0);
+          }
+        }
+        else if (pumpSub == PumpSub::FILL) {
+          progressSec(S.label, fillMs, tFillStart);
+          if ((millis() - tFillStart) >= fillMs) {
+            pumpSub = PumpSub::DONE;
+          }
+        }
+        else { // DONE
+          pumps.off(effPump);
+          show(S.label, "OK");
+          tPost = millis();
+          phase = Phase::POST;
+        }
+      }
+      else if (phase == Phase::POST) {
+        if (millis() - tPost >= MSG_MS) phase = Phase::EXIT;
+      }
+      else if (phase == Phase::EXIT) {
+        idx++; phase = Phase::ENTER;
+      }
+    } break;
+
+    case Op::MIXER_ON: {
+      if (phase == Phase::ENTER) {
+        pumps.on(PumpId::MIXER);
+        show("Mixer ON", "OK");
+        tPost = millis();
+        phase = Phase::POST;
+      } else if (phase == Phase::POST) {
+        if (millis() - tPost >= MSG_MS) phase = Phase::EXIT;
+      } else if (phase == Phase::EXIT) {
+        idx++; phase = Phase::ENTER;
+      }
+    } break;
+
+    case Op::MIXER_OFF: {
+      if (phase == Phase::ENTER) {
+        pumps.off(PumpId::MIXER);
+        show("Mixer OFF", "OK");
+        tPost = millis();
+        phase = Phase::POST;
+      } else if (phase == Phase::POST) {
+        if (millis() - tPost >= MSG_MS) phase = Phase::EXIT;
+      } else if (phase == Phase::EXIT) {
+        idx++; phase = Phase::ENTER;
+      }
+    } break;
+
+    case Op::WAIT: {
+      if (phase == Phase::ENTER) {
+        uint32_t waitMs = (S.dkind == DurKind::CONST) ? S.ms : computeTimeoutMs(S.dkind);
+        t0 = millis();
+        timeoutMs = waitMs;
+        phase = Phase::RUN;
+        progressSec(S.label, timeoutMs, t0);
+      } else if (phase == Phase::RUN) {
+        progressSec(S.label, timeoutMs, t0);
+        if ((millis() - t0) >= timeoutMs) {
+          show(S.label, "OK");
+          tPost = millis();
+          phase = Phase::POST;
+        }
+      } else if (phase == Phase::POST) {
+        if (millis() - tPost >= MSG_MS) phase = Phase::EXIT;
+      } else if (phase == Phase::EXIT) {
+        idx++; phase = Phase::ENTER;
+      }
+    } break;
+
+    case Op::READ_PH: {
+      if (phase == Phase::ENTER) {
+        char L0[17], L1[17];
+        snprintf(L0, sizeof(L0), "Leyendo pH");
+        snprintf(L1, sizeof(L1), " ");
+        show(L0, L1);
+
+        float ph = readPH();
+        lastPHShown = ph;
+
+        // Guardar en JSON del sample actual (1..4)
+        uint8_t sampleId = (uint8_t)(currentSample + 1);
+        if (sampleId < 1) sampleId = 1;
+        if (sampleId > 4) sampleId = 4;
+
+        uart2.setLastPh(ph);
+        uart2.setSamplePhValueById(sampleId, ph);
+
+        snprintf(L0, sizeof(L0), "pH: %.02f", ph);
+        snprintf(L1, sizeof(L1), "OK");
+        show(L0, L1);
+
+        tPost = millis();
+        phase = Phase::POST;
+      } else if (phase == Phase::POST) {
+        if (millis() - tPost >= MSG_MS) phase = Phase::EXIT;
+      } else if (phase == Phase::EXIT) {
+        idx++; phase = Phase::ENTER;
+      }
+    } break;
+
+    case Op::END: {
+      pumps.allOff();
+
+      // Fin de un ciclo de sample
+      currentSample++;
+
+      if (currentSample < totalSamples) {
+        char l0[17], l1[17];
+        snprintf(l0, sizeof(l0), "Sample %u/%u", (unsigned)currentSample, (unsigned)totalSamples);
+        snprintf(l1, sizeof(l1), "Repitiendo...");
+        lcd.splash(l0, l1, 800);
+
+        // Reiniciar receta
+        idx     = 0;
+        phase   = Phase::ENTER;
+        started = true;
+        return false;
+      }
+
+      // Todo completado
+      lcd.splash("AUTO OK", "Completado", 900);
+      started = false; idx = 0; phase = Phase::ENTER; lastPHShown = NAN;
+      currentSample = 0; totalSamples = 0;
+      return true;
+    }
+
+    default: {
+      pumps.allOff();
+      lcd.splash("AUTO", "Error step", 800);
+      started = false; idx = 0; phase = Phase::ENTER; lastPHShown = NAN;
+      currentSample = 0; totalSamples = 0;
+      return true;
+    }
+  }
+
+  return false;
 }
 
 static void MenuDemoTick() {
   // --- prototipos externos que usa el menú ---
   extern ConfigStore eeprom;
-  extern bool runADSCalibration_0V_3p31V(uint8_t, uint8_t);
-  extern bool runPHCalibration_7_4(uint8_t samples);
+  extern bool  runADSCalibration_0V_3p31V(uint8_t, uint8_t);
+  extern bool  runPHCalibration_7_4(uint8_t samples);
+  extern bool  runPHCalibration_4_7_10(uint16_t samples, bool piecewise);
   extern float readADC();
   extern float readPH();
   extern float readThermo();
-  extern bool AutoModeTick();
-  extern UartProto::UARTManager uart2; // <- NECESARIO
+  extern bool  AutoModeTick();
+  extern UartProto::UARTManager uart2;
 
   // Subpantallas externas
   extern bool ManualPumpsTick();
   extern bool ManualLevelsTick();
-  extern bool PumpTimesSetWizard();
-  extern bool PumpTimesTestWizard();
 
-  // ----- Estado persistente (solo dentro de esta función) -----
+  // Wizards de configuración
+  extern bool PumpTimeoutsWizard();
+  extern bool PumpFillLearnWizard();
+
+  // ----- Estado persistente -----
   enum class View : uint8_t {
     ROOT,
     MANUAL_MENU,
@@ -1412,52 +1860,50 @@ static void MenuDemoTick() {
     CAL_ADS_READ,
     CAL_ADS_RUN,
     CAL_PH_MENU,
-    CAL_PH_READ,
-    CAL_PH_RUN,
-    CFG_PUMP_TIMES_MENU,
-    CFG_PUMP_TIMES_SET,
-    CFG_PUMP_TIMES_TEST
+    CAL_PH_READ,        // <-- conservado
+    CAL_PH_RUN_2P,      // <-- calibración 2 puntos
+    CAL_PH_RUN_3P_PW,   // <-- calibración 3 puntos (piecewise)
+    CFG_TIMEOUTS,
+    CFG_FILL
   };
+
   static bool init = false;
   static View view = View::ROOT;
   static bool autoFirst = true;
 
-  // Root
+  // ----- Menús -----
   static const char *rootItems[] = {"Manual", "Automatico", "Configuracion"};
-  static const uint8_t ROOT_N = sizeof(rootItems) / sizeof(rootItems[0]);
   static uint8_t rootCursor = 0;
+  const uint8_t ROOT_N = sizeof(rootItems) / sizeof(rootItems[0]);
 
-  // Manual submenu
   static const char *manualItems[] = {"Bombas", "Sensores Nivel"};
-  static const uint8_t MAN_N = sizeof(manualItems) / sizeof(manualItems[0]);
   static uint8_t manualCursor = 0;
+  const uint8_t MAN_N = sizeof(manualItems) / sizeof(manualItems[0]);
 
-  // Config
-  static const char *cfgItems[] = {"pH", "O2", "Temperatura", "ADC",
-                                   "Tiempos bombeo"};
-  static const uint8_t CFG_N = sizeof(cfgItems) / sizeof(cfgItems[0]);
+  static const char *cfgItems[] = {"pH", "O2", "Temperatura", "ADC", "Timeouts", "Fill (aprender)"};
   static uint8_t cfgCursor = 0;
+  const uint8_t CFG_N = sizeof(cfgItems) / sizeof(cfgItems[0]);
 
-  // Submenús
   static const char *adsItems[] = {"Leer ADC", "Calibrar"};
-  static const uint8_t ADS_N = sizeof(adsItems) / sizeof(adsItems[0]);
   static uint8_t adsCursor = 0;
+  const uint8_t ADS_N = sizeof(adsItems) / sizeof(adsItems[0]);
 
-  static const char *phItems[] = {"Leer pH", "Calibrar pH"};
-  static const uint8_t PH_N = sizeof(phItems) / sizeof(phItems[0]);
+  // ---- Submenú pH: leer + 2 calibraciones ----
+  static const char *phItems[] = {
+    "Leer pH",
+    "Cal 7-4 (2p)",
+    "Cal 4-7-10 (PW)"
+  };
   static uint8_t phCursor = 0;
+  const uint8_t PH_N = sizeof(phItems) / sizeof(phItems[0]);
 
-  static const char *pumpTimeItems[] = {"Configurar", "Probar"};
-  static const uint8_t PT_N = sizeof(pumpTimeItems) / sizeof(pumpTimeItems[0]);
-  static uint8_t ptCursor = 0;
-
-  // Temperatura
+  // ---- Temperatura ----
   static int8_t tempOffset = 0;
   static float lastTemp = -1.0f;
   static unsigned long lastReadMs = 0;
   const unsigned long TEMP_READ_PERIOD = 500; // ms
 
-  // ----- Helpers UI -----
+  // ---- UI helpers ----
   auto renderRoot = [&]() {
     lcd.printAt(0, 0, "Menu");
     String line = ">" + String(rootItems[rootCursor]);
@@ -1465,64 +1911,45 @@ static void MenuDemoTick() {
   };
   auto renderManualMenu = [&]() {
     lcd.printAt(0, 0, "Manual");
-    String line = ">" + String(manualItems[manualCursor]);
-    lcd.printAt(0, 1, line);
+    lcd.printAt(0, 1, ">" + String(manualItems[manualCursor]));
   };
   auto renderConfig = [&]() {
     lcd.printAt(0, 0, "Configuracion");
-    String line = ">" + String(cfgItems[cfgCursor]);
-    lcd.printAt(0, 1, line);
+    lcd.printAt(0, 1, ">" + String(cfgItems[cfgCursor]));
   };
   auto renderTemp = [&]() {
     String l0 = "T:";
-    if (lastTemp >= 0.0f)
-      l0 += " " + String(lastTemp, 1) + " C";
-    else
-      l0 += " --.- C";
+    if (lastTemp >= 0.0f) l0 += " " + String(lastTemp, 1) + " C";
+    else l0 += " --.- C";
     lcd.printAt(0, 0, l0);
     char buf[17];
     snprintf(buf, sizeof(buf), "Off:%+d", (int)tempOffset);
     lcd.printAt(0, 1, buf);
   };
   auto renderADSMenu = [&]() {
-    lcd.printAt(0, 0, "Calibrar ADS");
-    String line = ">" + String(adsItems[adsCursor]);
-    lcd.printAt(0, 1, line);
+    lcd.printAt(0, 0, "Calibrar ADC");
+    lcd.printAt(0, 1, ">" + String(adsItems[adsCursor]));
   };
   auto renderPHMenu = [&]() {
     lcd.printAt(0, 0, "Calibrar pH");
-    String line = ">" + String(phItems[phCursor]);
-    lcd.printAt(0, 1, line);
-  };
-  auto renderPumpTimesMenu = [&]() {
-    lcd.printAt(0, 0, "Tiempos bombeo");
-    String line = ">" + String(pumpTimeItems[ptCursor]);
-    lcd.printAt(0, 1, line);
+    lcd.printAt(0, 1, ">" + String(phItems[phCursor]));
   };
   auto renderADSRead = [&]() {
     float v = readADC();
-    float m, b;
-    eeprom.getADC(m, b);
-    char l0[17];
-    snprintf(l0, sizeof(l0), "ADC: %.3f V", v);
-    char l1[17];
-    snprintf(l1, sizeof(l1), "m%.3f b%.3f", m, b);
+    float m, b; eeprom.getADC(m, b);
+    char l0[17]; snprintf(l0, sizeof(l0), "ADC: %.3f V", v);
+    char l1[17]; snprintf(l1, sizeof(l1), "m%.3f b%.3f", m, b);
     lcd.printAt(0, 0, l0);
     lcd.printAt(0, 1, l1);
   };
   auto renderPHRead = [&]() {
     float phv = readPH();
-    float V7s, V4s, tCs;
-    eeprom.getPH2pt(V7s, V4s, tCs);
-    char l0[17];
-    snprintf(l0, sizeof(l0), "pH: %.02f", phv);
-    char l1[17];
-    snprintf(l1, sizeof(l1), "V7=%.3f V4=%.3f", V7s, V4s);
+    char l0[17]; snprintf(l0, sizeof(l0), "pH: %.02f", phv);
     lcd.printAt(0, 0, l0);
-    lcd.printAt(0, 1, l1);
+    lcd.printAt(0, 1, "OK refrescar");
   };
 
-  // ----- Init perezoso -----
+  // ---- Init ----
   if (!init) {
     lcd.clear();
     renderRoot();
@@ -1530,59 +1957,30 @@ static void MenuDemoTick() {
     remoteManager.log("[MENU] Init -> ROOT");
   }
 
-  // ------------------ manejo robusto de auto_measure ------------------
+  // ---- Auto mode trigger por UART ----
   static bool prevAutoReq = false;
   bool autoReq = uart2.getAutoMeasureRequested();
   bool autoRun = uart2.getAutoRunning();
-
-  // Log de diagnóstico cada tick (ligero, puedes comentar si es ruidoso)
-  // remoteManager.log(String("[MENU] tick view=") + (int)view +
-  //                   " autoReq=" + (autoReq?"1":"0") +
-  //                   " prevAutoReq=" + (prevAutoReq?"1":"0") +
-  //                   " autoRun=" + (autoRun?"1":"0"));
-
-  // Condición de disparo:
-  // 1) Flanco de subida (autoReq && !prevAutoReq) Y estás en ROOT
-  // 2) O bien (autoReq está true, estás en ROOT y aún no estás en AUTO
-  // corriendo),
-  //    para cubrir pérdida de flanco entre núcleos.
   if (view == View::ROOT) {
     if ((autoReq && !prevAutoReq) || (autoReq && !autoRun)) {
-      remoteManager.log(
-          "[MENU] DISPARO AUTO: (root && (flanco || pendiente sin correr))");
-      view = View::AUTO;
-      autoFirst = true;
-      // sincroniza "estado" para que no vuelva a intentar
-      prevAutoReq = autoReq; // normalmente true
+      view = View::AUTO; autoFirst = true;
+      remoteManager.log("[MENU] DISPARO AUTO desde ROOT");
     }
   }
   prevAutoReq = autoReq;
 
-  // ------------------ botones / latches ------------------
+  // ---- Botones ----
   Buttons::testButtons();
-
   enum class Btn : uint8_t { NONE, OK, ESC, UP, DOWN };
   auto readLatched = []() -> Btn {
-    if (Buttons::BTN_OK.value) {
-      Buttons::BTN_OK.reset();
-      return Btn::OK;
-    }
-    if (Buttons::BTN_ESC.value) {
-      Buttons::BTN_ESC.reset();
-      return Btn::ESC;
-    }
-    if (Buttons::BTN_UP.value) {
-      Buttons::BTN_UP.reset();
-      return Btn::UP;
-    }
-    if (Buttons::BTN_DOWN.value) {
-      Buttons::BTN_DOWN.reset();
-      return Btn::DOWN;
-    }
+    if (Buttons::BTN_OK.value)   { Buttons::BTN_OK.reset();   return Btn::OK; }
+    if (Buttons::BTN_ESC.value)  { Buttons::BTN_ESC.reset();  return Btn::ESC; }
+    if (Buttons::BTN_UP.value)   { Buttons::BTN_UP.reset();   return Btn::UP; }
+    if (Buttons::BTN_DOWN.value) { Buttons::BTN_DOWN.reset(); return Btn::DOWN; }
     return Btn::NONE;
   };
 
-  // --- refresco periódico solo para TEMP ---
+  // ---- Refresco temperatura ----
   if (view == View::TEMP) {
     unsigned long now = millis();
     if (now - lastReadMs >= TEMP_READ_PERIOD) {
@@ -1593,363 +1991,143 @@ static void MenuDemoTick() {
     }
   }
 
-  // ------------------ FSM del menú ------------------
+  // ---- FSM ----
   switch (view) {
+  // ---------- ROOT ----------
   case View::ROOT: {
     switch (readLatched()) {
-    case Btn::UP:
-      rootCursor = (rootCursor == 0) ? (ROOT_N - 1) : (rootCursor - 1);
-      lcd.clear();
-      renderRoot();
-      break;
-    case Btn::DOWN:
-      rootCursor = (rootCursor + 1) % ROOT_N;
-      lcd.clear();
-      renderRoot();
-      break;
-    case Btn::OK:
-      if (rootCursor == 0) {
-        view = View::MANUAL_MENU;
-        lcd.clear();
-        renderManualMenu();
-        remoteManager.log("[MENU] -> MANUAL_MENU");
-      } else if (rootCursor == 1) {
-        autoFirst = true;
-        view = View::AUTO;
-        lcd.clear();
-        remoteManager.log("[MENU] -> AUTO (botón)");
-      } else {
-        view = View::CONFIG;
-        lcd.clear();
-        renderConfig();
-        remoteManager.log("[MENU] -> CONFIG");
-      }
-      break;
-    default:
-      break;
+      case Btn::UP:
+        rootCursor = (rootCursor == 0) ? 2 : rootCursor - 1;
+        lcd.clear(); renderRoot(); break;
+      case Btn::DOWN:
+        rootCursor = (rootCursor + 1) % 3;
+        lcd.clear(); renderRoot(); break;
+      case Btn::OK:
+        if (rootCursor == 0) { view = View::MANUAL_MENU; lcd.clear(); renderManualMenu(); }
+        else if (rootCursor == 1) { view = View::AUTO; autoFirst = true; lcd.clear(); }
+        else { view = View::CONFIG; lcd.clear(); renderConfig(); }
+        break;
+      default: break;
     }
   } break;
 
+  // ---------- MANUAL ----------
   case View::MANUAL_MENU: {
     switch (readLatched()) {
-    case Btn::UP:
-      manualCursor = (manualCursor == 0) ? (MAN_N - 1) : (manualCursor - 1);
-      lcd.clear();
-      renderManualMenu();
-      break;
-    case Btn::DOWN:
-      manualCursor = (manualCursor + 1) % MAN_N;
-      lcd.clear();
-      renderManualMenu();
-      break;
-    case Btn::OK:
-      lcd.clear();
-      if (manualCursor == 0) {
-        view = View::MANUAL_PUMPS;
-        remoteManager.log("[MENU] -> MANUAL_PUMPS");
-      } else {
-        view = View::MANUAL_LEVELS;
-        remoteManager.log("[MENU] -> MANUAL_LEVELS");
-      }
-      break;
-    case Btn::ESC:
-      view = View::ROOT;
-      lcd.clear();
-      renderRoot();
-      remoteManager.log("[MENU] <- ROOT");
-      break;
-    default:
-      break;
+      case Btn::UP:
+        manualCursor = (manualCursor == 0) ? 1 : manualCursor - 1;
+        lcd.clear(); renderManualMenu(); break;
+      case Btn::DOWN:
+        manualCursor = (manualCursor + 1) % 2;
+        lcd.clear(); renderManualMenu(); break;
+      case Btn::OK:
+        lcd.clear();
+        view = (manualCursor == 0) ? View::MANUAL_PUMPS : View::MANUAL_LEVELS;
+        break;
+      case Btn::ESC:
+        view = View::ROOT; lcd.clear(); renderRoot(); break;
+      default: break;
     }
   } break;
 
-  case View::MANUAL_PUMPS: {
-    static bool first = true;
-    if (first) {
-      lcd.clear();
-      first = false;
-    }
-    if (ManualPumpsTick()) {
-      view = View::MANUAL_MENU;
-      lcd.clear();
-      renderManualMenu();
-      first = true;
-      remoteManager.log("[MENU] MANUAL_PUMPS done -> MANUAL_MENU");
-    }
-  } break;
+  case View::MANUAL_PUMPS:
+    if (ManualPumpsTick()) { view = View::MANUAL_MENU; lcd.clear(); renderManualMenu(); }
+    break;
+  case View::MANUAL_LEVELS:
+    if (ManualLevelsTick()) { view = View::MANUAL_MENU; lcd.clear(); renderManualMenu(); }
+    break;
 
-  case View::MANUAL_LEVELS: {
-    if (ManualLevelsTick()) {
-      view = View::MANUAL_MENU;
-      lcd.clear();
-      renderManualMenu();
-      remoteManager.log("[MENU] MANUAL_LEVELS done -> MANUAL_MENU");
-    }
-  } break;
-
-  case View::AUTO: {
-    if (autoFirst) {
-      lcd.clear();
-      autoFirst = false;
-      remoteManager.log("[MENU] AUTO first draw");
-    }
-
+  // ---------- AUTO ----------
+  case View::AUTO:
+    if (autoFirst) { lcd.clear(); autoFirst = false; }
     uart2.setAutoRunning(true);
-
     if (AutoModeTick()) {
-      view = View::ROOT;
-      lcd.clear();
-      renderRoot();
-      autoFirst = true;
+      view = View::ROOT; lcd.clear(); renderRoot();
       uart2.setAutoRunning(false);
-      uart2.setAutoMeasureRequested(false); // limpia petición
-      remoteManager.log("[MENU] AUTO finished -> ROOT, flags limpiadas");
+      uart2.setAutoMeasureRequested(false);
     }
-  } break;
+    break;
 
+  // ---------- CONFIG ----------
   case View::CONFIG: {
     switch (readLatched()) {
-    case Btn::UP:
-      cfgCursor = (cfgCursor == 0) ? (CFG_N - 1) : (cfgCursor - 1);
-      lcd.clear();
-      renderConfig();
-      break;
-    case Btn::DOWN:
-      cfgCursor = (cfgCursor + 1) % CFG_N;
-      lcd.clear();
-      renderConfig();
-      break;
-    case Btn::OK:
-      lcd.clear();
-      if (cfgCursor == 0) {
-        view = View::CAL_PH_MENU;
-        renderPHMenu();
-        remoteManager.log("[MENU] -> CAL_PH_MENU");
-      } else if (cfgCursor == 1) {
-        lcd.splash("Calibrar O2", "Pendiente", 700);
-        renderConfig();
-      } else if (cfgCursor == 2) {
-        view = View::TEMP;
-        renderTemp();
-        remoteManager.log("[MENU] -> TEMP");
-      } else if (cfgCursor == 3) {
-        view = View::CAL_ADS_MENU;
-        renderADSMenu();
-        remoteManager.log("[MENU] -> CAL_ADS_MENU");
-      } else {
-        ptCursor = 0;
-        view = View::CFG_PUMP_TIMES_MENU;
-        renderPumpTimesMenu();
-        remoteManager.log("[MENU] -> CFG_PUMP_TIMES_MENU");
-      }
-      break;
-    case Btn::ESC:
-      view = View::ROOT;
-      lcd.clear();
-      renderRoot();
-      remoteManager.log("[MENU] <- ROOT");
-      break;
-    default:
-      break;
-    }
-  } break;
-
-  case View::CAL_ADS_MENU: {
-    switch (readLatched()) {
-    case Btn::UP:
-      adsCursor = (adsCursor == 0) ? (ADS_N - 1) : (adsCursor - 1);
-      lcd.clear();
-      renderADSMenu();
-      break;
-    case Btn::DOWN:
-      adsCursor = (adsCursor + 1) % ADS_N;
-      lcd.clear();
-      renderADSMenu();
-      break;
-    case Btn::OK:
-      if (adsCursor == 0) {
+      case Btn::UP:
+        cfgCursor = (cfgCursor == 0) ? (CFG_N - 1) : cfgCursor - 1;
+        lcd.clear(); renderConfig(); break;
+      case Btn::DOWN:
+        cfgCursor = (cfgCursor + 1) % CFG_N;
+        lcd.clear(); renderConfig(); break;
+      case Btn::OK:
         lcd.clear();
-        renderADSRead();
-        view = View::CAL_ADS_READ;
-        remoteManager.log("[MENU] -> CAL_ADS_READ");
-      } else {
-        lcd.clear();
-        view = View::CAL_ADS_RUN;
-        remoteManager.log("[MENU] -> CAL_ADS_RUN");
-      }
-      break;
-    case Btn::ESC:
-      view = View::CONFIG;
-      lcd.clear();
-      renderConfig();
-      remoteManager.log("[MENU] <- CONFIG");
-      break;
-    default:
-      break;
+        if (cfgCursor == 0) view = View::CAL_PH_MENU, renderPHMenu();
+        else if (cfgCursor == 1) lcd.splash("Calibrar O2", "Pendiente", 700), renderConfig();
+        else if (cfgCursor == 2) view = View::TEMP, renderTemp();
+        else if (cfgCursor == 3) view = View::CAL_ADS_MENU, renderADSMenu();
+        else if (cfgCursor == 4) view = View::CFG_TIMEOUTS;
+        else view = View::CFG_FILL;
+        break;
+      case Btn::ESC:
+        view = View::ROOT; lcd.clear(); renderRoot(); break;
+      default: break;
     }
   } break;
 
-  case View::CAL_ADS_READ: {
-    switch (readLatched()) {
-    case Btn::OK:
-      lcd.clear();
-      renderADSRead();
-      break;
-    case Btn::ESC:
-      view = View::CAL_ADS_MENU;
-      lcd.clear();
-      renderADSMenu();
-      remoteManager.log("[MENU] <- CAL_ADS_MENU");
-      break;
-    default:
-      break;
-    }
-  } break;
-
-  case View::CAL_ADS_RUN: {
-    if (runADSCalibration_0V_3p31V(0, 32)) {
-      view = View::CAL_ADS_MENU;
-      lcd.clear();
-      renderADSMenu();
-      remoteManager.log("[MENU] CAL_ADS_RUN done -> CAL_ADS_MENU");
-    }
-  } break;
-
+  // ---------- CALIBRACIÓN PH ----------
   case View::CAL_PH_MENU: {
     switch (readLatched()) {
-    case Btn::UP:
-      phCursor = (phCursor == 0) ? (PH_N - 1) : (phCursor - 1);
-      lcd.clear();
-      renderPHMenu();
-      break;
-    case Btn::DOWN:
-      phCursor = (phCursor + 1) % PH_N;
-      lcd.clear();
-      renderPHMenu();
-      break;
-    case Btn::OK:
-      if (phCursor == 0) {
-        lcd.clear();
-        renderPHRead();
-        view = View::CAL_PH_READ;
-        remoteManager.log("[MENU] -> CAL_PH_READ");
-      } else {
-        lcd.clear();
-        view = View::CAL_PH_RUN;
-        remoteManager.log("[MENU] -> CAL_PH_RUN");
-      }
-      break;
-    case Btn::ESC:
-      view = View::CONFIG;
-      lcd.clear();
-      renderConfig();
-      remoteManager.log("[MENU] <- CONFIG");
-      break;
-    default:
-      break;
+      case Btn::UP:
+        phCursor = (phCursor == 0) ? (PH_N - 1) : phCursor - 1;
+        lcd.clear(); renderPHMenu(); break;
+      case Btn::DOWN:
+        phCursor = (phCursor + 1) % PH_N;
+        lcd.clear(); renderPHMenu(); break;
+      case Btn::OK:
+        if (phCursor == 0) view = View::CAL_PH_READ, lcd.clear(), renderPHRead();
+        else if (phCursor == 1) view = View::CAL_PH_RUN_2P, lcd.clear();
+        else view = View::CAL_PH_RUN_3P_PW, lcd.clear();
+        break;
+      case Btn::ESC:
+        view = View::CONFIG; lcd.clear(); renderConfig(); break;
+      default: break;
     }
   } break;
 
   case View::CAL_PH_READ: {
     switch (readLatched()) {
-    case Btn::OK:
-      lcd.clear();
-      renderPHRead();
-      break;
-    case Btn::ESC:
-      view = View::CAL_PH_MENU;
-      lcd.clear();
-      renderPHMenu();
-      remoteManager.log("[MENU] <- CAL_PH_MENU");
-      break;
-    default:
-      break;
+      case Btn::OK: lcd.clear(); renderPHRead(); break;
+      case Btn::ESC: view = View::CAL_PH_MENU; lcd.clear(); renderPHMenu(); break;
+      default: break;
     }
   } break;
 
-  case View::CAL_PH_RUN: {
-    if (runPHCalibration_7_4(5)) {
-      view = View::CAL_PH_MENU;
-      lcd.clear();
-      renderPHMenu();
-      remoteManager.log("[MENU] CAL_PH_RUN done -> CAL_PH_MENU");
+  case View::CAL_PH_RUN_2P:
+    if (runPHCalibration_7_4(31)) {
+      view = View::CAL_PH_MENU; lcd.clear(); renderPHMenu();
     }
-  } break;
+    break;
 
-  case View::CFG_PUMP_TIMES_MENU: {
-    switch (readLatched()) {
-    case Btn::UP:
-      ptCursor = (ptCursor == 0) ? (PT_N - 1) : (ptCursor - 1);
-      lcd.clear();
-      renderPumpTimesMenu();
-      break;
-    case Btn::DOWN:
-      ptCursor = (ptCursor + 1) % PT_N;
-      lcd.clear();
-      renderPumpTimesMenu();
-      break;
-    case Btn::OK:
-      lcd.clear();
-      view = (ptCursor == 0) ? View::CFG_PUMP_TIMES_SET
-                             : View::CFG_PUMP_TIMES_TEST;
-      remoteManager.log(String("[MENU] -> ") + ((ptCursor == 0)
-                                                    ? "CFG_PUMP_TIMES_SET"
-                                                    : "CFG_PUMP_TIMES_TEST"));
-      break;
-    case Btn::ESC:
-      view = View::CONFIG;
-      lcd.clear();
-      renderConfig();
-      remoteManager.log("[MENU] <- CONFIG");
-      break;
-    default:
-      break;
+  case View::CAL_PH_RUN_3P_PW:
+    if (runPHCalibration_4_7_10(31, false)) {
+      view = View::CAL_PH_MENU; lcd.clear(); renderPHMenu();
     }
-  } break;
+    break;
 
-  case View::CFG_PUMP_TIMES_SET: {
-    if (PumpTimesSetWizard()) {
-      view = View::CFG_PUMP_TIMES_MENU;
-      lcd.clear();
-      renderPumpTimesMenu();
-      remoteManager.log("[MENU] SET done -> CFG_PUMP_TIMES_MENU");
-    }
-  } break;
+  // ---------- WIZARDS ----------
+  case View::CFG_TIMEOUTS:
+    if (PumpTimeoutsWizard()) { view = View::CONFIG; lcd.clear(); renderConfig(); }
+    break;
+  case View::CFG_FILL:
+    if (PumpFillLearnWizard()) { view = View::CONFIG; lcd.clear(); renderConfig(); }
+    break;
 
-  case View::CFG_PUMP_TIMES_TEST: {
-    // if (PumpTimesTestWizard()) {
-    //   view = View::CFG_PUMP_TIMES_MENU; lcd.clear(); renderPumpTimesMenu();
-    //   remoteManager.log("[MENU] TEST done -> CFG_PUMP_TIMES_MENU");
-    // }
-  } break;
-
+  // ---------- TEMP ----------
   case View::TEMP: {
     switch (readLatched()) {
-    case Btn::UP:
-      if (tempOffset < 10)
-        ++tempOffset;
-      lcd.clear();
-      renderTemp();
-      break;
-    case Btn::DOWN:
-      if (tempOffset > -10)
-        --tempOffset;
-      lcd.clear();
-      renderTemp();
-      break;
-    case Btn::OK:
-      lcd.splash("Temp offset", "Guardado", 600);
-      view = View::CONFIG;
-      lcd.clear();
-      renderConfig();
-      break;
-    case Btn::ESC:
-      view = View::CONFIG;
-      lcd.clear();
-      renderConfig();
-      break;
-    default:
-      break;
+      case Btn::UP: if (tempOffset < 10) ++tempOffset; lcd.clear(); renderTemp(); break;
+      case Btn::DOWN: if (tempOffset > -10) --tempOffset; lcd.clear(); renderTemp(); break;
+      case Btn::OK: lcd.splash("Temp offset", "Guardado", 600); view = View::CONFIG; lcd.clear(); renderConfig(); break;
+      case Btn::ESC: view = View::CONFIG; lcd.clear(); renderConfig(); break;
+      default: break;
     }
   } break;
   }

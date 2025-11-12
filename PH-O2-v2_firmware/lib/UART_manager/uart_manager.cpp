@@ -1,5 +1,5 @@
 #include "uart_manager.h"
-#include "globals.h"   // aquí está definido remoteManager
+#include "globals.h"   // remoteManager
 
 namespace UartProto {
 
@@ -8,7 +8,7 @@ UARTManager::UARTManager(Stream& inOut) : io_(inOut) {
 }
 
 void UARTManager::begin(unsigned long baud) {
-  (void)baud; // SerialX.begin(...) lo hace el usuario
+  (void)baud; // El SerialX.begin(...) lo hace el usuario
   remoteManager.log("[UART] begin() llamado (recuerda inicializar SerialX)");
 }
 
@@ -34,39 +34,62 @@ void UARTManager::loop() {
 }
 
 // ====== Setters ======
-void UARTManager::setLevelH2O(bool v)         { lock(); levelH2O_ok_ = v; unlock(); }
-void UARTManager::setLevelKCL(bool v)         { lock(); levelKCL_ok_ = v; unlock(); }
-void UARTManager::setAutoRunning(bool v)      { lock(); auto_running_ = v; unlock(); }
-void UARTManager::setAutoMeasureRequested(bool v){ lock(); autoMeasureRequested_ = v; unlock(); }
+void UARTManager::setLevelH2O(bool v)              { lock(); levelH2O_ok_ = v;            unlock(); }
+void UARTManager::setLevelKCL(bool v)              { lock(); levelKCL_ok_ = v;            unlock(); }
+void UARTManager::setAutoRunning(bool v)           { lock(); auto_running_ = v;           unlock(); }
+void UARTManager::setAutoMeasureRequested(bool v)  { lock(); autoMeasureRequested_ = v;   unlock(); }
 
-void UARTManager::setLastPh(float v)          { lock(); last_ph_ = v; last_has_data_ = true; unlock(); }
-void UARTManager::setLastTempC(float v)       { lock(); last_tempC_ = v; last_has_data_ = true; unlock(); }
-void UARTManager::setLastResult(const String& r){ lock(); last_result_ = r; last_has_data_ = true; unlock(); }
-void UARTManager::setLastHasData(bool v)      { lock(); last_has_data_ = v; unlock(); }
+void UARTManager::setLastPh(float v)               { lock(); last_ph_ = v;  last_has_data_ = true; unlock(); }
+void UARTManager::setLastTempC(float v)            { lock(); last_tempC_ = v; last_has_data_ = true; unlock(); }
+void UARTManager::setLastResult(const String& r)   { lock(); last_result_ = r; last_has_data_ = true; unlock(); }
+void UARTManager::setLastHasData(bool v)           { lock(); last_has_data_ = v; unlock(); }
+
+// Setters por SAMPLE (por id 1..4)
+void UARTManager::setSamplePhValueById(uint8_t id, float v) {
+  uint8_t idx = idToIndex_(id);
+  if (idx == 255) return;
+  lock(); sample_ph_val_[idx] = v; unlock();
+}
+void UARTManager::setSampleO2ValueById(uint8_t id, float v) {
+  uint8_t idx = idToIndex_(id);
+  if (idx == 255) return;
+  lock(); sample_o2_val_[idx] = v; unlock();
+}
 
 // ====== Getters ======
-bool   UARTManager::getLevelH2O() const       { return levelH2O_ok_; }
-bool   UARTManager::getLevelKCL() const       { return levelKCL_ok_; }
-bool   UARTManager::getAutoRunning() const    { return auto_running_; }
-bool   UARTManager::getAutoMeasureRequested() const { return autoMeasureRequested_; }
+bool   UARTManager::getLevelH2O() const            { return levelH2O_ok_; }
+bool   UARTManager::getLevelKCL() const            { return levelKCL_ok_; }
+bool   UARTManager::getAutoRunning() const         { return auto_running_; }
+bool   UARTManager::getAutoMeasureRequested() const{ return autoMeasureRequested_; }
 
-float  UARTManager::getLastPh() const         { return last_ph_; }
-float  UARTManager::getLastTempC() const      { return last_tempC_; }
-String UARTManager::getLastResult() const     { return last_result_; }
-bool   UARTManager::getLastHasData() const    { return last_has_data_; }
+float  UARTManager::getLastPh() const              { return last_ph_; }
+float  UARTManager::getLastTempC() const           { return last_tempC_; }
+String UARTManager::getLastResult() const          { return last_result_; }
+bool   UARTManager::getLastHasData() const         { return last_has_data_; }
+
+// Getters por SAMPLE (por id 1..4)
+float UARTManager::getSamplePhValueById(uint8_t id) const {
+  uint8_t idx = idToIndex_(id);
+  if (idx == 255) return NAN;
+  return sample_ph_val_[idx];
+}
+float UARTManager::getSampleO2ValueById(uint8_t id) const {
+  uint8_t idx = idToIndex_(id);
+  if (idx == 255) return NAN;
+  return sample_o2_val_[idx];
+}
 
 // ================== Procesamiento NDJSON ==================
 void UARTManager::processLine_(const String& lineRaw) {
-
-    String line = lineRaw;
-    line.trim();
-    int i = line.indexOf('{');
-    if (i > 0) line.remove(0, i);
-    if (line.isEmpty() || line[0] != '{') {
-        remoteManager.log("[UART] DESCARTE: línea sin JSON válido");
-        sendError_("BAD_JSON");
-        return;
-    }
+  String line = lineRaw;
+  line.trim();
+  int i = line.indexOf('{');
+  if (i > 0) line.remove(0, i);
+  if (line.isEmpty() || line[0] != '{') {
+    remoteManager.log("[UART] DESCARTE: línea sin JSON válido");
+    sendError_("BAD_JSON");
+    return;
+  }
 
   StaticJsonDocument<256> in;
   DeserializationError err = deserializeJson(in, line);
@@ -88,40 +111,70 @@ void UARTManager::processLine_(const String& lineRaw) {
   }
 }
 
+// Helper: inyecta arreglo "samples" con {id, ph_val, o2_val}
+void UARTManager::addSamplesArray_(JsonObject parent) {
+  JsonArray arr = parent.createNestedArray("samples");
+  for (uint8_t i = 0; i < 4; ++i) {
+    float phv, o2v;
+    lock(); 
+      phv = sample_ph_val_[i]; 
+      o2v = sample_o2_val_[i];
+    unlock();
+
+    JsonObject it = arr.createNestedObject();
+    it["id"]      = (uint8_t)(i + 1);
+    // Escribir null si no hay valor (NaN)
+    if (isfinite(phv)) it["ph_val"] = phv; else it["ph_val"] = nullptr;
+    if (isfinite(o2v)) it["o2_val"] = o2v; else it["o2_val"] = nullptr;
+  }
+}
+
 // --- get_status ---
 void UARTManager::handle_get_status_() {
+  bool h2o, kcl, run, areq;
   lock();
-  bool h2o   = levelH2O_ok_;
-  bool kcl   = levelKCL_ok_;
-  bool run   = auto_running_;
-  bool areq  = autoMeasureRequested_;
+  h2o  = levelH2O_ok_;
+  kcl  = levelKCL_ok_;
+  run  = auto_running_;
+  areq = autoMeasureRequested_;
   unlock();
 
-  StaticJsonDocument<192> out;
+  StaticJsonDocument<512> out;
   out["ok"] = true;
   JsonObject data = out.createNestedObject("data");
+
   JsonObject js = data.createNestedObject("level_sensors");
   js["h2o"] = h2o;
   js["kcl"] = kcl;
+
   data["auto_running"] = run;
   data["auto_req"]     = areq;
+
+  // [{id, ph_val, o2_val} x4]
+  addSamplesArray_(data);
+
   sendJson_(out);
 
   remoteManager.log(String("[UART] TX get_status -> h2o=") + (h2o?"1":"0") +
-             " kcl=" + (kcl?"1":"0") +
-             " auto_running=" + (run?"1":"0") +
-             " auto_req=" + (areq?"1":"0"));
+                    " kcl=" + (kcl?"1":"0") +
+                    " auto_running=" + (run?"1":"0") +
+                    " auto_req=" + (areq?"1":"0"));
 }
 
 // --- get_last ---
 void UARTManager::handle_get_last_() {
+  bool has;
+  float ph, tc;
+  String res;
+  bool h2o, kcl;
+
   lock();
-  bool has = last_has_data_;
-  float ph = last_ph_;
-  float tc = last_tempC_;
-  String res = last_result_;
-  bool h2o = levelH2O_ok_;
-  bool kcl = levelKCL_ok_;
+  has = last_has_data_;
+  ph  = last_ph_;
+  tc  = last_tempC_;
+  res = last_result_;
+  h2o = levelH2O_ok_;
+  kcl = levelKCL_ok_;
   unlock();
 
   if (!has) {
@@ -130,22 +183,27 @@ void UARTManager::handle_get_last_() {
     return;
   }
 
-  StaticJsonDocument<256> out;
+  StaticJsonDocument<576> out;
   out["ok"] = true;
   JsonObject data = out.createNestedObject("data");
-  data["ph"] = ph;
+  data["ph"]    = ph;
   data["tempC"] = tc;
+
   JsonObject js = data.createNestedObject("level_sensors");
   js["h2o"] = h2o;
   js["kcl"] = kcl;
+
+  // [{id, ph_val, o2_val} x4]
+  addSamplesArray_(data);
+
   data["result"] = res;
   sendJson_(out);
 
   remoteManager.log(String("[UART] TX get_last -> ph=") + ph +
-             " tempC=" + tc +
-             " h2o=" + (h2o?"1":"0") +
-             " kcl=" + (kcl?"1":"0") +
-             " result=" + res);
+                    " tempC=" + tc +
+                    " h2o=" + (h2o?"1":"0") +
+                    " kcl=" + (kcl?"1":"0") +
+                    " result=" + res);
 }
 
 // --- auto_measure ---
@@ -178,11 +236,9 @@ void UARTManager::sendError_(const char* err) {
 }
 
 void UARTManager::sendJson_(const JsonDocument& doc) {
-  // Serializa a un String y envía con println -> agrega \r\n como Serial.println
   String payload;
   serializeJson(doc, payload);
   io_.println(payload);
 }
-
 
 } // namespace UartProto

@@ -4,11 +4,14 @@
 #include "LCD_manager.h"
 #include "ADS1115_manager.h"
 #include "DS18B20_manager.h"
+#include "level_sensors_manager.h"
 
 #define SW_DOWN 36
 #define SW_UP 39
 #define SW_OK 35
 #define SW_ESC 34
+#define SENSOR_LEVEL_O2 26
+#define SENSOR_LEVEL_PH 27
 #define SENSOR_LEVEL_H2O 33
 #define SENSOR_LEVEL_KCL 32
 
@@ -28,5 +31,6 @@ extern Lcd16x2 lcd;
 extern RemoteAccessManager remoteManager;
 extern ADS1115Manager ads;
 extern DS18B20Manager thermo;
+
 
 #endif
