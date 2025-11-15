@@ -543,28 +543,6 @@ static void testDS18B20() {
   Serial.println("Saliendo de la prueba DS18B20...");
 }
 
-#if 0
-void i2cScan(TwoWire &bus) {
-  Serial.println("\n--- Escáner I2C ---");
-  uint8_t found = 0;
-  for (uint8_t addr = 0x03; addr <= 0x77; addr++) {
-    bus.beginTransmission(addr);
-    uint8_t err = bus.endTransmission();
-    if (err == 0) {
-      Serial.printf("  ✔ 0x%02X", addr);
-      if ((addr >= 0x20 && addr <= 0x27) || (addr >= 0x38 && addr <= 0x3F))
-        Serial.print("  (posible PCF8574/8574A)");
-      Serial.println();
-      found++;
-    }
-    delay(2);
-  }
-  if (!found) Serial.println("  (sin dispositivos)");
-  Serial.println("--------------------\n");
-}
-
-#endif
-
 // -------------------- ADS1115 (A0..A3) --------------------
 static void ads1115PrintAll(Adafruit_ADS1115 &ads) {
   for (uint8_t ch = 0; ch < 4; ++ch) {

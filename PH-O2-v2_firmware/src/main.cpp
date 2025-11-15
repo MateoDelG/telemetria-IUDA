@@ -61,6 +61,24 @@ void setup() {
 
 void loop() { delay(100); }
 
+void testpin(){
+
+  pinMode(SENSOR_LEVEL_H2O, OUTPUT);
+  digitalWrite(SENSOR_LEVEL_H2O, HIGH);
+  delay(10000);
+  remoteManager.log(String("Pin ") + String(SENSOR_LEVEL_H2O) + " set HIGH.");
+
+  digitalWrite(SENSOR_LEVEL_H2O, LOW);
+  delay(10000);
+  remoteManager.log(String("Pin ") + String(SENSOR_LEVEL_H2O) + " set LOW.");
+
+  pinMode(SENSOR_LEVEL_H2O, INPUT_PULLUP);
+  remoteManager.log(String("Pin ") + String(SENSOR_LEVEL_H2O) + " set INPUT.");
+  delay(1000);
+
+  remoteManager.log(String("Pin ") + String(SENSOR_LEVEL_H2O) + " test done." + String("state=") + String(digitalRead(SENSOR_LEVEL_H2O)));
+}
+
 void taskCore0(void *pvParameters) {
   for (;;) {
     if (startProcess) {
@@ -72,6 +90,7 @@ void taskCore0(void *pvParameters) {
       // readPH();
       MenuDemoTick();
       // AutoModeTick();
+      // testpin();
 
 
     }
@@ -313,14 +332,6 @@ float readPH() {
   return phValue;
 }
 
-
-// Calibración a 2 puntos del ADS usando tu ADS1115Manager (single-ended).
-// Puntos: 0.00 V y 3.31 V. Captura lecturas *sin calibración* y calcula
-// scale/offset para que: V_real = scale * V_meas + offset.
-//
-// Modo de uso: llama a esta función en cada tick cuando el usuario elija
-// “Configuración → Calibrar ADS”. La función maneja la UI paso a paso.
-// Devuelve true cuando termina (éxito o cancelado) para que regreses al menú.
 static bool runADSCalibration_0V_3p31V(uint8_t channel = 0,
                                        uint8_t samples = 32) {
   enum class Step : uint8_t {
@@ -474,7 +485,6 @@ static bool runADSCalibration_0V_3p31V(uint8_t channel = 0,
     return true;        // informa al caller que ya terminó
   }
 }
-
 
 static bool runPHCalibration_7_4(uint8_t samples = 64) {
   // Externs típicos del proyecto
@@ -1519,7 +1529,7 @@ static bool AutoModeTick() {
     { Op::MIXER_OFF,   PumpId::MIXER,   DurKind::CONST,        0, "Mixer OFF"   },
     { Op::READ_PH,     PumpId::MIXER,   DurKind::CONST,        0, "Leer pH"     },
     { Op::PUMP_FOR,    PumpId::DRAIN,   DurKind::DRAIN_T,      0, "Drenando"    },
-    // H2O/KCL SIN TIMEOUTS (v6): esperar sensor sin límite y luego respetar fill time
+    // H2O/KCL: SIN sensores ni timeout → sólo FILL ascendente
     { Op::PUMP_FOR,    PumpId::H2O,     DurKind::CONST,        0, "H2O"         },
     { Op::PUMP_FOR,    PumpId::KCL,     DurKind::CONST,        0, "KCL"         },
     { Op::END,         PumpId::KCL,     DurKind::CONST,        0, "FIN"         },
@@ -1551,12 +1561,24 @@ static bool AutoModeTick() {
     lcd.printAt(0, 0, l0);
     lcd.printAt(0, 1, l1);
   };
-  auto progressSec = [&](const char* title, uint32_t totalMs, unsigned long tStart) {
-    unsigned long secs = (millis() - tStart) / 1000UL;
+
+  // Timeouts: cuenta regresiva (restante / total)
+  auto progressTimeoutCountdown = [&](const char* title, uint32_t totalMs, unsigned long tStart) {
+    uint32_t elapsed = (uint32_t)(millis() - tStart);
+    uint32_t remain  = (elapsed >= totalMs) ? 0 : (totalMs - elapsed);
     char L0[17], L1[17];
     snprintf(L0, sizeof(L0), "%s", title);
-    unsigned long tot = (totalMs > 0) ? (totalMs / 1000UL) : 0;
-    snprintf(L1, sizeof(L1), "t=%lus/%lus", secs, tot);
+    snprintf(L1, sizeof(L1), "t=%lus/%lus", (unsigned long)(remain/1000UL), (unsigned long)(totalMs/1000UL));
+    show(L0, L1);
+  };
+
+  // Fills: ascendente (transcurrido / total)
+  auto progressFillUp = [&](const char* title, uint32_t totalMs, unsigned long tStart) {
+    uint32_t elapsed = (uint32_t)(millis() - tStart);
+    if (elapsed > totalMs) elapsed = totalMs;
+    char L0[17], L1[17];
+    snprintf(L0, sizeof(L0), "%s", title);
+    snprintf(L1, sizeof(L1), "t=%lus/%lus", (unsigned long)(elapsed/1000UL), (unsigned long)(totalMs/1000UL));
     show(L0, L1);
   };
 
@@ -1611,16 +1633,16 @@ static bool AutoModeTick() {
     lastPHShown = NAN;
   }
 
-  // ---------- Sensor alcanzado? (según requerimiento) ----------
+  // ---------- Sensor alcanzado? ----------
   auto sensorReached = [&](PumpId pump) -> bool {
     switch (pump) {
-      case PumpId::KCL:     return levels.kcl();                    // activo=HIGH
-      case PumpId::H2O:     return levels.h2o();                    // activo=HIGH
+      case PumpId::KCL:     return false; // (1) NO dependen de sensores
+      case PumpId::H2O:     return false; // (1) NO dependen de sensores
       case PumpId::SAMPLE1:
       case PumpId::SAMPLE2:
       case PumpId::SAMPLE3:
-      case PumpId::SAMPLE4: return (!levels.o2() && !levels.ph());    // ambos ACTIVOS
-      case PumpId::DRAIN:   return (levels.o2() && levels.ph());  // ambos INACTIVOS
+      case PumpId::SAMPLE4: return (!levels.o2() && !levels.ph()); // ambos ACTIVOS
+      case PumpId::DRAIN:   return (levels.o2() && levels.ph());   // ambos INACTIVOS
       default:              return false;
     }
   };
@@ -1657,15 +1679,27 @@ static bool AutoModeTick() {
       PumpId effPump = (S.pump == PumpId::SAMPLE1) ? samplePumpForCycle() : S.pump;
 
       if (phase == Phase::ENTER) {
-        timeoutMs = computeTimeoutMs(S.dkind);   // 0 para CONST -> sin timeout
+        timeoutMs = computeTimeoutMs(S.dkind);   // 0 para CONST
         fillMs    = computeFillMs(effPump);
-        if (fillMs == 0) fillMs = 500;          // mínimo seguridad
+        if (fillMs == 0) fillMs = 500;           // mínimo
 
         pumps.on(effPump);
-        pumpSub   = PumpSub::WAIT_SENSOR;
-        t0        = millis();
-        show(S.label, "Esperando sens");
-        phase     = Phase::RUN;
+
+        // (1) KCL/H2O no esperan sensor ni tienen timeout → saltar directo a FILL
+        if (effPump == PumpId::KCL || effPump == PumpId::H2O) {
+          pumpSub    = PumpSub::FILL;
+          tFillStart = millis();
+          progressFillUp(S.label, fillMs, tFillStart); // ascendente
+        } else {
+          pumpSub = PumpSub::WAIT_SENSOR;
+          t0      = millis();
+          if (timeoutMs > 0)
+            progressTimeoutCountdown(S.label, timeoutMs, t0); // regresiva
+          else
+            show(S.label, "Esperando sens");
+        }
+
+        phase = Phase::RUN;
       }
       else if (phase == Phase::RUN) {
         if (pumpSub == PumpSub::WAIT_SENSOR) {
@@ -1675,10 +1709,7 @@ static bool AutoModeTick() {
           if (reached) {
             pumpSub    = PumpSub::FILL;
             tFillStart = millis();
-
-            // DRAIN: tras alcanzar INACTIVOS, ahora drena por drainMs()
-            // SAMPLE: tras alcanzar ACTIVOS, ahora llena por sampleFillMs()
-            progressSec(S.label, fillMs, tFillStart);
+            progressFillUp(S.label, fillMs, tFillStart);       // ascendente
           } else if (to_exp) {
             pumps.off(effPump);
             lcd.splash("AUTO STOP", "Timeout sensor", 900);
@@ -1686,12 +1717,11 @@ static bool AutoModeTick() {
             currentSample = 0; totalSamples = 0;
             return true;
           } else {
-            // Mostrar progreso contra timeout si aplica
-            if (timeoutMs > 0) progressSec(S.label, timeoutMs, t0);
+            if (timeoutMs > 0) progressTimeoutCountdown(S.label, timeoutMs, t0); // regresiva
           }
         }
         else if (pumpSub == PumpSub::FILL) {
-          progressSec(S.label, fillMs, tFillStart);
+          progressFillUp(S.label, fillMs, tFillStart);         // ascendente
           if ((millis() - tFillStart) >= fillMs) {
             pumpSub = PumpSub::DONE;
           }
@@ -1743,9 +1773,9 @@ static bool AutoModeTick() {
         t0 = millis();
         timeoutMs = waitMs;
         phase = Phase::RUN;
-        progressSec(S.label, timeoutMs, t0);
+        progressTimeoutCountdown(S.label, timeoutMs, t0); // regresiva
       } else if (phase == Phase::RUN) {
-        progressSec(S.label, timeoutMs, t0);
+        progressTimeoutCountdown(S.label, timeoutMs, t0); // regresiva
         if ((millis() - t0) >= timeoutMs) {
           show(S.label, "OK");
           tPost = millis();
@@ -1765,18 +1795,18 @@ static bool AutoModeTick() {
         snprintf(L1, sizeof(L1), " ");
         show(L0, L1);
 
-        float ph = readPH();
-        lastPHShown = ph;
+        float phv = readPH();
+        lastPHShown = phv;
 
         // Guardar en JSON del sample actual (1..4)
         uint8_t sampleId = (uint8_t)(currentSample + 1);
         if (sampleId < 1) sampleId = 1;
         if (sampleId > 4) sampleId = 4;
 
-        uart2.setLastPh(ph);
-        uart2.setSamplePhValueById(sampleId, ph);
+        uart2.setLastPh(phv);
+        uart2.setSamplePhValueById(sampleId, phv);
 
-        snprintf(L0, sizeof(L0), "pH: %.02f", ph);
+        snprintf(L0, sizeof(L0), "pH: %.02f", phv);
         snprintf(L1, sizeof(L1), "OK");
         show(L0, L1);
 
