@@ -1,5 +1,12 @@
 #include "Globals.h"
 
+// Bits del estado del sensor A02
+// Bit 0 = CHECKSUM_ERROR
+// Bit 1 = OUT_OF_RANGE
+// Bit 2 = NO_DATA (sin paquetes por más de X ms)
+// Bit 3 = FILTER_NAN
+// Bit 4 = PACKET_FORMAT_ERROR
+
 namespace Globals {
 
   // ----------------------
@@ -10,6 +17,9 @@ namespace Globals {
 
   static float distanceRaw = NAN;
   static float distanceFiltered = NAN;
+
+  static uint8_t sensorStatus = 0;
+
 
   static float minLevel = 20.0f;
   static float maxLevel = 100.0f;
@@ -33,6 +43,9 @@ namespace Globals {
 
   void setDistanceFiltered(float v) { distanceFiltered = v; }
   float getDistanceFiltered()       { return distanceFiltered; }
+
+  void setSensorStatus(uint8_t s) { sensorStatus = s; }
+  uint8_t getSensorStatus()       { return sensorStatus; }
 
   void setMinLevel(float v)         { minLevel = v; }
   float getMinLevel()               { return minLevel; }

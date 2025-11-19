@@ -39,6 +39,9 @@ private:
   float _distanceCmRaw      = NAN;
   float _distanceCmFiltered = NAN;
 
+  uint8_t _errorFlags = 0;
+  unsigned long _lastPacketTime = 0;
+
   bool  _hasValid          = false;
   bool  _kalmanInitialized = false;
 

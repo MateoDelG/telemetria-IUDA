@@ -4,6 +4,8 @@
 #include "ConfigPortal.h"
 #include "Globals.h"
 #include "Storage.h"
+#include "I2CSlaveManager.h"
+
 
 
 // ----------------------------
@@ -11,6 +13,16 @@
 // ----------------------------
 #define PIN_LEVEL_MIN   6   // salida nivel bajo
 #define PIN_LEVEL_MAX   7   // salida nivel alto
+
+// Bits de estado del sensor (los mismos que usaste en la librería)
+#define ERR_CHECKSUM      0x01  // bit0
+#define ERR_OUT_OF_RANGE  0x02  // bit1
+#define ERR_NO_DATA       0x04  // bit2
+#define ERR_FILTER_NAN    0x08  // bit3
+#define ERR_PKT_FORMAT    0x10  // bit4
+
+static uint8_t g_lastSensorStatus = 0xFF;  // valor imposible inicial para forzar primer print
+
 
 // Sensor UART
 UltrasonicA02YYUW sensor(Serial1, 3, 4);
@@ -33,27 +45,28 @@ static uint8_t g_i2cAddressApplied = 0x30;
 static unsigned long g_lastSampleMs = 0;
 
 // Prototipos
+void setupOutputs();
 void setupDistance();
+void setupSlaveI2C();
+void i2cUpdate();
 void readDistance();
 void updateLevelOutputs();
 void monitorConfigChanges();
+void printSensorStatusIfChanged();
 
 void setup() {
   Serial.begin(115200);
   delay(300);
 
   // Salidas
-  pinMode(PIN_LEVEL_MIN, OUTPUT);
-  pinMode(PIN_LEVEL_MAX, OUTPUT);
-  digitalWrite(PIN_LEVEL_MIN, LOW);
-  digitalWrite(PIN_LEVEL_MAX, LOW);
-
+  setupOutputs();
   // Inicializar sensor
   setupDistance();
+  // Inicializar esclavo I2C
+  setupSlaveI2C();
 
   // Tiempo de configuración: 3 minutos = 180000 ms
   wifiCfg.begin("SensorNivel", "12345678", 180000);
-
   // Levantar el portal (AP + DNS + Web)
   portal.begin();
 
@@ -63,6 +76,7 @@ void setup() {
 void loop() {
   portal.loop();      // WebServer + DNS
   wifiCfg.update();
+  // i2cUpdate();       // Actualizar datos del esclavo I2C
 
   // Ver si cambió algo en la configuración (Globals)
   monitorConfigChanges();
@@ -75,9 +89,39 @@ void loop() {
   if (now - g_lastSampleMs >= (unsigned long)sp) {
     g_lastSampleMs = now;
     readDistance();                  // actualizar Globals con lecturas
+    printSensorStatusIfChanged();
     updateLevelOutputs();            // actualizar salidas digitales
   }
 }
+
+// ------------------------------------------
+// Configuración de salidas digitales
+// ------------------------------------------
+void setupOutputs() {
+  pinMode(PIN_LEVEL_MIN, OUTPUT);
+  pinMode(PIN_LEVEL_MAX, OUTPUT);
+  digitalWrite(PIN_LEVEL_MIN, LOW);
+  digitalWrite(PIN_LEVEL_MAX, LOW);
+}
+// ------------------------------------------
+// Configuración del esclavo I2C
+// ------------------------------------------
+void setupSlaveI2C() {
+    uint8_t addr = Globals::getI2CAddress();
+    I2CSlaveManager::begin(addr);
+    Serial.println("[MAIN] Dispositivo iniciado como esclavo I2C");
+}
+void i2cUpdate() {
+  float fr = Globals::getDistanceFiltered();
+  float rr = Globals::getDistanceRaw();
+
+  I2CSlaveManager::setFilteredDistance(fr);
+  I2CSlaveManager::setRawDistance(rr);
+
+  // debug opcional:
+  Serial.printf("[I2CUpdate] Filt=%.2f  Raw=%.2f\n", fr, rr);
+}
+
 
 // ------------------------------------------
 // Configuración inicial del sensor y Kalman
@@ -220,3 +264,27 @@ void monitorConfigChanges() {
   }
 }
 
+void printSensorStatusIfChanged() {
+  uint8_t st = Globals::getSensorStatus();
+
+  // Solo imprime si cambió el estado
+  if (st == g_lastSensorStatus) return;
+  g_lastSensorStatus = st;
+
+  Serial.print("[SENSOR] Status = 0x");
+  Serial.printf("%02X -> ", st);
+
+  if (st == 0) {
+    Serial.println("OK (sin errores)");
+    return;
+  }
+
+  // Decodificar bits
+  if (st & ERR_CHECKSUM)     Serial.print("CHECKSUM_ERROR ");
+  if (st & ERR_OUT_OF_RANGE) Serial.print("OUT_OF_RANGE ");
+  if (st & ERR_NO_DATA)      Serial.print("NO_DATA ");
+  if (st & ERR_FILTER_NAN)   Serial.print("FILTER_NAN ");
+  if (st & ERR_PKT_FORMAT)   Serial.print("PACKET_FORMAT_ERROR ");
+
+  Serial.println();
+}

@@ -11,6 +11,10 @@ namespace Globals {
 
   void setDistanceFiltered(float v);
   float getDistanceFiltered();
+  
+// ---- Estado del sensor (bits) ----
+  void setSensorStatus(uint8_t s);
+  uint8_t getSensorStatus();
 
   // ---- Configuración del usuario ----
   void setMinLevel(float v);

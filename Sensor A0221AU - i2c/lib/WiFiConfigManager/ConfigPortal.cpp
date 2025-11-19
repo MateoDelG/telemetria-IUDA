@@ -1,3 +1,4 @@
+#include <stdlib.h> 
 #include "ConfigPortal.h"
 #include "Globals.h"
 
@@ -96,13 +97,17 @@ button {
 
     html += "<label>Nivel mínimo (cm):</label>";
     html += "<input id='min' type='number' step='0.1' value='" + String(minLevel,1) + "'>";
-    html += "<button class='small-btn' onclick='setMinFromSensor()'>Usar lectura actual (" + String(distNow,1) + " cm)</button>";
+    html += "<button class='small-btn' onclick='setMinFromSensor()'>Usar lectura actual</button>";
 
     html += "<label>Nivel máximo (cm):</label>";
     html += "<input id='max' type='number' step='0.1' value='" + String(maxLevel,1) + "'>";
-    html += "<button class='small-btn' onclick='setMaxFromSensor()'>Usar lectura actual (" + String(distNow,1) + " cm)</button>";
+    html += "<button class='small-btn' onclick='setMaxFromSensor()'>Usar lectura actual</button>";
+
+    html += "<label style='margin-top:18px;'>Lectura actual (cm):</label>";
+    html += "<input id='currentDist' type='text' value='" + String(distNow,1) + " cm' readonly>";
 
     html += "</div>";
+
 
     // Intervalo de muestreo
     html += "<div class='card'><h3>Muestreo</h3>";
@@ -110,12 +115,20 @@ button {
     html += "<input id='sample' type='number' value='" + String(sample) + "'>";
     html += "</div>";
 
-    // Comunicación I2C
+    // Comunicación I2C (HEX)
     html += "<div class='card'><h3>Comunicación I2C</h3>";
-    html += "<label>Dirección I2C (7 bits, 1–127):</label>";
-    html += "<input id='i2c' type='number' min='1' max='127' value='" + String(i2cAddr) + "'>";
-    html += "<small>Se usa como dirección esclavo I2C del sensor.</small>";
+
+    // formatear dirección actual en HEX (2 dígitos)
+    char i2cHex[5];
+    sprintf(i2cHex, "%02X", i2cAddr);
+
+    html += "<label>Dirección I2C (HEX, 0x01–0x7F):</label>";
+    html += String("<input id='i2c' type='text' pattern='[0-9A-Fa-fxX]+' ")
+        + "placeholder='0x30' value='0x" + String(i2cHex) + "'>";
+    html += "<small>Ingresa en hexadecimal, por ejemplo 0x30, 30, 0x3A, etc.</small>";
     html += "</div>";
+
+
 
     // Parámetros Kalman
     html += "<div class='card'><h3>Filtro Kalman</h3>";
@@ -182,9 +195,16 @@ function fetchStatus() {
             if (data.length > maxPoints) data.shift();
             drawChart();
             document.getElementById("liveValue").innerText = value.toFixed(1) + " cm";
+
+            // Actualizar campo de lectura actual en la tarjeta de niveles
+            const cd = document.getElementById("currentDist");
+            if (cd) {
+              cd.value = value.toFixed(1) + " cm";
+            }
         }
     });
 }
+
 
 // Variables persistentes para autoscale suave
 let smoothMin = null;
@@ -359,11 +379,31 @@ setInterval(fetchStatus, 30);
       Globals::setKalQ(_server.arg("kalQ").toFloat());
 
     if (_server.hasArg("i2c")) {
-        int a = _server.arg("i2c").toInt();
-        if (a < 1)   a = 1;
-        if (a > 127) a = 127;
-        Globals::setI2CAddress((uint8_t)a);
-  }
+        String s = _server.arg("i2c");
+        s.trim();
+        s.toUpperCase();
+
+        // Aceptar formas: "0x30", "30", "0X3A"
+        if (s.startsWith("0X")) {
+          s = s.substring(2);
+        }
+
+        // Limitar a 2–3 caracteres por seguridad
+        s = s.substring(0, 3);
+
+        char buf[5];
+        s.toCharArray(buf, sizeof(buf));
+
+        char* endPtr = nullptr;
+        long val = strtoul(buf, &endPtr, 16);   // base 16
+
+        if (val < 1)   val = 1;
+        if (val > 127) val = 127;
+
+        Globals::setI2CAddress((uint8_t)val);
+        Serial.printf("[ConfigPortal] Nueva dirección I2C (HEX) = 0x%02lX (%ld)\n", val, val);
+    }
+
 
     _server.send(200, "text/plain", "OK");
   });

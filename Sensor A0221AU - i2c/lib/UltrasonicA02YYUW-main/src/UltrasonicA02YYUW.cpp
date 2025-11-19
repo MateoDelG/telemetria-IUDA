@@ -1,5 +1,5 @@
 #include "UltrasonicA02YYUW.h"
-
+#include "Globals.h"
 UltrasonicA02YYUW::UltrasonicA02YYUW(
     HardwareSerial &serialPort,
     int rxPin,
@@ -20,6 +20,13 @@ void UltrasonicA02YYUW::begin(unsigned long baudrate) {
 }
 
 void UltrasonicA02YYUW::update() {
+
+  // Si no llegan datos por más de 150 ms → error NO_DATA
+  if (millis() - _lastPacketTime > 150) {
+    _errorFlags |= 0x04;  // bit2 = NO_DATA
+    Globals::setSensorStatus(_errorFlags);
+  }
+
   while (_serial.available()) {
     uint8_t byteIn = _serial.read();
 
@@ -28,6 +35,8 @@ void UltrasonicA02YYUW::update() {
         if (byteIn == 0xFF) {
           _buffer[0] = byteIn;
           _index = 1;
+        } else {
+          _errorFlags |= 0x10; // PACKET_FORMAT_ERROR
         }
         break;
 
@@ -35,10 +44,10 @@ void UltrasonicA02YYUW::update() {
       case 2:
       case 3:
         _buffer[_index++] = byteIn;
-
         if (_index > 3) {
           processPacket();
           _index = 0;
+          _lastPacketTime = millis();
         }
         break;
 
@@ -48,47 +57,54 @@ void UltrasonicA02YYUW::update() {
   }
 }
 
+
 void UltrasonicA02YYUW::processPacket() {
   uint8_t h   = _buffer[1];
   uint8_t l   = _buffer[2];
   uint8_t sum = _buffer[3];
 
-  // checksum
+  _errorFlags = 0;  // limpiamos, se recalcula con cada paquete
+
   uint8_t expected = (uint8_t)((0xFF + h + l) & 0xFF);
   if (expected != sum) {
+    _errorFlags |= 0x01;  // CHECKSUM_ERROR
+    Globals::setSensorStatus(_errorFlags);
     return;
   }
 
-  // mm → cm
-  int   mm = ((uint16_t)h << 8) | l;
+  int mm = ((uint16_t)h << 8) | l;
   float cm = mm / 10.0f;
 
-  // rango válido del sensor
   if (cm < 3.0f || cm > 750.0f) {
+    _errorFlags |= 0x02; // OUT_OF_RANGE
+    Globals::setSensorStatus(_errorFlags);
     return;
   }
 
+  // OK: lectura válida
   _distanceCmRaw = cm;
   _hasValid = true;
 
-  // ---------------------------
-  // 🟢 Arranque inteligente del filtro
-  // ---------------------------
+  // Inicialización del filtro
   if (!_kalmanInitialized) {
     _distanceCmFiltered = cm;
-
-    // Primer update para inicializar internamente:
     _kalman.updateEstimate(cm);
-
     _kalmanInitialized = true;
+
+    Globals::setSensorStatus(_errorFlags);
     return;
   }
 
-  // ---------------------------
-  // 🟢 Filtro Kalman normal
-  // ---------------------------
+  // Filtro Kalman
   _distanceCmFiltered = _kalman.updateEstimate(cm);
+
+  if (isnan(_distanceCmFiltered)) {
+    _errorFlags |= 0x08; // FILTER_NAN
+  }
+
+  Globals::setSensorStatus(_errorFlags);
 }
+
 
 float UltrasonicA02YYUW::getDistanceRaw() const {
   return _distanceCmRaw;
