@@ -151,7 +151,7 @@ button {
     html += "<button onclick='saveConfig()'>Guardar configuración</button>";
 
     // JS
-    html += R"HTML(
+     html += R"HTML(
 <script>
 function saveConfig() {
   let url = "/save?"
@@ -167,33 +167,72 @@ function saveConfig() {
 }
 
 function setMinFromSensor() {
-  fetch("/setMin").then(() => location.reload());
+  const cd = document.getElementById("currentDist");
+  const minInput = document.getElementById("min");
+  if (!cd || !minInput) return;
+
+  // cd.value tiene algo como "123.4 cm"
+  const val = parseFloat(cd.value);
+  if (!isNaN(val)) {
+    minInput.value = val.toFixed(1);
+  }
 }
 
 function setMaxFromSensor() {
-  fetch("/setMax").then(() => location.reload());
+  const cd = document.getElementById("currentDist");
+  const maxInput = document.getElementById("max");
+  if (!cd || !maxInput) return;
+
+  const val = parseFloat(cd.value);
+  if (!isNaN(val)) {
+    maxInput.value = val.toFixed(1);
+  }
 }
+
 </script>
 
+<!-- Gráfica de nivel -->
 <div class='card'>
-  <h3>Gráfica en tiempo real</h3>
-  <canvas id="chart" width="400" height="200" style="width:100%;"></canvas>
+  <h3>Gráfica de Nivel en tiempo real</h3>
+  <canvas id="chartLevel" width="400" height="200" style="width:100%;"></canvas>
   <p id="liveValue" style="font-size:1.2em; margin-top:8px;">-- cm</p>
 </div>
 
+<!-- *** NUEVO: gráfica de temperatura *** -->
+<div class='card'>
+  <h3>Gráfica de Temperatura en tiempo real</h3>
+  <canvas id="chartTemp" width="400" height="200" style="width:100%;"></canvas>
+  <p id="liveTemp" style="font-size:1.2em; margin-top:8px;">-- °C</p>
+</div>
+
 <script>
-let data = [];
-let maxPoints = 120;    // ~1 minuto si actualiza cada 500 ms
+// ---------------------------
+// Buffers de datos
+// ---------------------------
+let dataLevel = [];
+let dataTemp  = [];
+let maxPoints = 50; // Máximo de puntos en la gráfica
+
+// Variables persistentes para autoscale suave (nivel)
+let smoothMinLevel = null;
+let smoothMaxLevel = null;
+
+// Variables persistentes para autoscale suave (temperatura)
+let smoothMinTemp = null;
+let smoothMaxTemp = null;
 
 function fetchStatus() {
   fetch("/status")
     .then(r => r.json())
     .then(j => {
         const value = j.filt;
+        const temp  = j.temp;
+
+        // ---- Nivel ----
         if (!isNaN(value)) {
-            data.push(value);
-            if (data.length > maxPoints) data.shift();
-            drawChart();
+            dataLevel.push(value);
+            if (dataLevel.length > maxPoints) dataLevel.shift();
+            drawLevelChart();
             document.getElementById("liveValue").innerText = value.toFixed(1) + " cm";
 
             // Actualizar campo de lectura actual en la tarjeta de niveles
@@ -202,16 +241,26 @@ function fetchStatus() {
               cd.value = value.toFixed(1) + " cm";
             }
         }
+
+        // ---- Temperatura (*** NUEVO ***) ----
+        if (!isNaN(temp)) {
+            dataTemp.push(temp);
+            if (dataTemp.length > maxPoints) dataTemp.shift();
+            drawTempChart();
+            const lt = document.getElementById("liveTemp");
+            if (lt) {
+              lt.innerText = temp.toFixed(1) + " °C";
+            }
+        }
     });
 }
 
-
-// Variables persistentes para autoscale suave
-let smoothMin = null;
-let smoothMax = null;
-
-function drawChart() {
-    const canvas = document.getElementById("chart");
+// ---------------------------
+// Función de dibujo genérica
+// ---------------------------
+function drawLineChart(canvasId, data, units, smoothMinRef, smoothMaxRef, minSpanDefault) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
     const ctx = canvas.getContext("2d");
     const w = canvas.width;
     const h = canvas.height;
@@ -219,80 +268,62 @@ function drawChart() {
     ctx.clearRect(0, 0, w, h);
     if (data.length < 2) return;
 
-    // --------------------------------------------------------
     // Rango real de datos
-    // --------------------------------------------------------
     let realMin = Math.min(...data);
     let realMax = Math.max(...data);
-
     let span = realMax - realMin;
 
-    // --------------------------------------------------------
-    // Añadir margen visual del 10%
-    // --------------------------------------------------------
+    // Margen visual 10%
     let margin = span * 0.1;
     realMin -= margin;
     realMax += margin;
 
-    // --------------------------------------------------------
-    // Nunca mostrar valores negativos
-    // --------------------------------------------------------
+    // No negativos
     if (realMin < 0) realMin = 0;
-
     span = realMax - realMin;
 
-    // --------------------------------------------------------
-    // Zoom mínimo (70 cm)
-    // Si el rango es pequeño, centramos la señal
-    // --------------------------------------------------------
-    const MIN_SPAN = 70;
+    // Zoom mínimo configurable
+    const MIN_SPAN = minSpanDefault;
 
     if (span < MIN_SPAN) {
         let mid = (realMin + realMax) / 2;
-
         realMin = mid - MIN_SPAN / 2;
         realMax = mid + MIN_SPAN / 2;
 
-        // asegurar mínimo 0
         if (realMin < 0) {
             realMin = 0;
             realMax = MIN_SPAN;
         }
-
         span = MIN_SPAN;
     }
 
-    // --------------------------------------------------------
     // Autoscale suave (damping)
-    // --------------------------------------------------------
-    if (smoothMin === null) {
-        smoothMin = realMin;
-        smoothMax = realMax;
+    if (smoothMinRef.value === null) {
+        smoothMinRef.value = realMin;
+        smoothMaxRef.value = realMax;
     } else {
-        const step = 1.0; // cuánto se ajusta por actualización
+        const step = 1.0; // ajuste por actualización
 
         // smoothMin
-        if (realMin < smoothMin - step) smoothMin -= step;
-        else if (realMin > smoothMin + step) smoothMin += step;
-        else smoothMin = realMin;
+        if (realMin < smoothMinRef.value - step) smoothMinRef.value -= step;
+        else if (realMin > smoothMinRef.value + step) smoothMinRef.value += step;
+        else smoothMinRef.value = realMin;
 
         // smoothMax
-        if (realMax < smoothMax - step) smoothMax -= step;
-        else if (realMax > smoothMax + step) smoothMax += step;
-        else smoothMax = realMax;
+        if (realMax < smoothMaxRef.value - step) smoothMaxRef.value -= step;
+        else if (realMax > smoothMaxRef.value + step) smoothMaxRef.value += step;
+        else smoothMaxRef.value = realMax;
     }
 
-    if (smoothMin < 0) smoothMin = 0;
+    if (smoothMinRef.value < 0) smoothMinRef.value = 0;
 
-    let range = smoothMax - smoothMin;
+    let range = smoothMaxRef.value - smoothMinRef.value;
     if (range < MIN_SPAN) {
-        smoothMax = smoothMin + MIN_SPAN;
+        smoothMaxRef.value = smoothMinRef.value + MIN_SPAN;
         range = MIN_SPAN;
     }
 
-    // --------------------------------------------------------
     // Cuadrícula + eje Y
-    // --------------------------------------------------------
     ctx.strokeStyle = "#cccccc";
     ctx.lineWidth = 1;
     ctx.font = "12px Arial";
@@ -301,7 +332,7 @@ function drawChart() {
     let gridLines = 4;
     for (let i = 0; i <= gridLines; i++) {
         let gy = (i / gridLines) * h;
-        let value = smoothMax - (i / gridLines) * range;
+        let value = smoothMaxRef.value - (i / gridLines) * range;
 
         if (value < 0) value = 0;
 
@@ -310,19 +341,17 @@ function drawChart() {
         ctx.lineTo(w, gy);
         ctx.stroke();
 
-        ctx.fillText(value.toFixed(1) + " cm", 5, gy - 3);
+        ctx.fillText(value.toFixed(1) + " " + units, 5, gy - 3);
     }
 
-    // --------------------------------------------------------
     // Línea de la gráfica
-    // --------------------------------------------------------
     ctx.beginPath();
     ctx.lineWidth = 2;
     ctx.strokeStyle = "#007AFF";
 
     for (let i = 0; i < data.length; i++) {
         let x = (i / (maxPoints - 1)) * w;
-        let y = h - ((data[i] - smoothMin) / range) * h;
+        let y = h - ((data[i] - smoothMinRef.value) / range) * h;
 
         if (i === 0) ctx.moveTo(x, y);
         else ctx.lineTo(x, y);
@@ -330,11 +359,78 @@ function drawChart() {
 
     ctx.stroke();
 
-    // --------------------------------------------------------
     // Punto actual
-    // --------------------------------------------------------
     let lastX = ((data.length - 1) / (maxPoints - 1)) * w;
-    let lastY = h - ((data[data.length - 1] - smoothMin) / range) * h;
+    let lastY = h - ((data[data.length - 1] - smoothMinRef.value) / range) * h;
+
+    ctx.fillStyle = "#ff0000";
+    ctx.beginPath();
+    ctx.arc(lastX, lastY, 4, 0, 2 * Math.PI);
+    ctx.fill();
+}
+
+// Wrappers específicos
+function drawLevelChart() {
+    if (smoothMinLevel === null) smoothMinLevel = 0;
+    if (smoothMaxLevel === null) smoothMaxLevel = 100;
+    drawLineChart(
+      "chartLevel",
+      dataLevel,
+      "cm",
+      { get value(){return smoothMinLevel;}, set value(v){smoothMinLevel = v;} },
+      { get value(){return smoothMaxLevel;}, set value(v){smoothMaxLevel = v;} },
+      70 // MIN_SPAN para nivel
+    );
+}
+
+function drawTempChart() {
+    const canvas = document.getElementById("chartTemp");
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const w = canvas.width;
+    const h = canvas.height;
+
+    ctx.clearRect(0, 0, w, h);
+    if (dataTemp.length < 2) return;
+
+    // Rango fijo para temperatura
+    const realMin = 10;   // °C
+    const realMax = 40;   // °C
+    const range   = realMax - realMin;
+
+    // Cuadrícula + eje Y
+    ctx.strokeStyle = "#cccccc";
+    ctx.lineWidth = 1;
+    ctx.font = "12px Arial";
+    ctx.fillStyle = "#555";
+
+    let gridLines = 4;
+    for (let i = 0; i <= gridLines; i++) {
+        let gy = (i / gridLines) * h;
+        let value = realMax - (i / gridLines) * range;
+        ctx.beginPath();
+        ctx.moveTo(0, gy);
+        ctx.lineTo(w, gy);
+        ctx.stroke();
+        ctx.fillText(value.toFixed(1) + " °C", 5, gy - 3);
+    }
+
+    // Línea de la gráfica
+    ctx.beginPath();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#FF9500";  // otro color que el nivel si quieres distinguir
+
+    for (let i = 0; i < dataTemp.length; i++) {
+        let x = (i / (maxPoints - 1)) * w;
+        let y = h - ((dataTemp[i] - realMin) / range) * h;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Punto actual
+    let lastX = ((dataTemp.length - 1) / (maxPoints - 1)) * w;
+    let lastY = h - ((dataTemp[dataTemp.length - 1] - realMin) / range) * h;
 
     ctx.fillStyle = "#ff0000";
     ctx.beginPath();
@@ -343,11 +439,8 @@ function drawChart() {
 }
 
 
-
-
-
 // Actualización periódica
-setInterval(fetchStatus, 30);
+setInterval(fetchStatus, 100);
 </script>
 
 </body>
@@ -409,24 +502,29 @@ setInterval(fetchStatus, 30);
   });
 
   // --------------------------- NIVELES DESDE LECTURA ---------------------------
-_server.on("/setMin", HTTP_GET, [this]() {
-    Globals::setMinLevel(Globals::getDistanceFiltered());
-    _server.send(200, "text/plain", "OK");
-});
+// _server.on("/setMin", HTTP_GET, [this]() {
+//     Globals::setMinLevel(Globals::getDistanceFiltered());
+//     _server.send(200, "text/plain", "OK");
+// });
 
-_server.on("/setMax", HTTP_GET, [this]() {
-    Globals::setMaxLevel(Globals::getDistanceFiltered());
-    _server.send(200, "text/plain", "OK");
-});
+// _server.on("/setMax", HTTP_GET, [this]() {
+//     Globals::setMaxLevel(Globals::getDistanceFiltered());
+//     _server.send(200, "text/plain", "OK");
+// });
 
 _server.on("/status", HTTP_GET, [this]() {
     String json = "{";
     json += "\"raw\":" + String(Globals::getDistanceRaw()) + ",";
     json += "\"filt\":" + String(Globals::getDistanceFiltered()) + ",";
+
+    // *** NUEVO: temperatura en el JSON ***
+    json += "\"temp\":" + String(Globals::getTemperature()) + ",";
+
     json += "\"hasClient\":" + String(Globals::getAPClients());
     json += "}";
     _server.send(200, "application/json", json);
 });
+
 
 
   _server.begin();

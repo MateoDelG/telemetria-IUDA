@@ -106,7 +106,7 @@ static void onRequest() {
         break;
     }
 
-    // Nivel mínimo (float) leído desde Globals
+    // Nivel mínimo (float)
     case 0x08: {
         union { float f; uint8_t b[4]; } u;
         u.f = Globals::getMinLevel();
@@ -115,7 +115,7 @@ static void onRequest() {
         break;
     }
 
-    // Nivel máximo (float) leído desde Globals
+    // Nivel máximo (float)
     case 0x0C: {
         union { float f; uint8_t b[4]; } u;
         u.f = Globals::getMaxLevel();
@@ -124,7 +124,16 @@ static void onRequest() {
         break;
     }
 
-    // Status / versión
+    // *** NUEVO: Temperatura (float, °C) ***
+    case 0x10: {
+        union { float f; uint8_t b[4]; } u;
+        u.f = Globals::getTemperature();   // asegúrate de tener esta función en Globals
+        Serial.printf("[I2C SLAVE] Enviando temperatura=%.2f °C\n", u.f);
+        Wire.write(u.b, 4);
+        break;
+    }
+
+    // Status / versión / flags de error
     case 0x20:
         Wire.write(Globals::getSensorStatus());
         break;

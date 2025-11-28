@@ -43,7 +43,7 @@ void WiFiConfigManager::stopAP() {
     // Desconecta el AP (borra clientes y apaga beacon)
     WiFi.softAPdisconnect(true);
     // Apaga completamente el WiFi
-    WiFi.mode(WIFI_OFF);
+    // WiFi.mode(WIFI_OFF);
 
     _state = APState::OFF;
     Serial.println("[WiFiConfig] AP apagado");

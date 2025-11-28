@@ -94,23 +94,28 @@ namespace LevelSensorMaster {
 
   bool writeMinLevel(float cm) { return writeFloatReg(REG_MIN_LEVEL, cm); }
   bool writeMaxLevel(float cm) { return writeFloatReg(REG_MAX_LEVEL, cm); }
+  float readTemperature() { return readFloatReg(REG_TEMP); }
+
 
   bool readAll(float &distFilt,
                float &distRaw,
                float &minLevel,
                float &maxLevel,
+               float &tempC,
                uint8_t &status) {
     distFilt = readFilteredDistance();
     distRaw  = readRawDistance();
     minLevel = readMinLevel();
     maxLevel = readMaxLevel();
+    tempC    = readTemperature();
     status   = readStatus();
 
-    // Consideramos que hay fallo si alguno es NaN o status=0xFF (error de lectura)
-    if (isnan(distFilt) || isnan(distRaw) || isnan(minLevel) || isnan(maxLevel) || status == 0xFF)
+    if (isnan(distFilt) || isnan(distRaw) || isnan(minLevel) || isnan(maxLevel) ||
+        isnan(tempC)   || status == 0xFF)
       return false;
     return true;
   }
+
 
   // ----------------------------------------------------
   // Status helpers

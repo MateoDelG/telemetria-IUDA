@@ -12,7 +12,9 @@ namespace LevelSensorMaster {
   constexpr uint8_t REG_DIST_RAW      = 0x04;
   constexpr uint8_t REG_MIN_LEVEL     = 0x08;
   constexpr uint8_t REG_MAX_LEVEL     = 0x0C;
+  constexpr uint8_t REG_TEMP          = 0x10;  // <<< NUEVO: temperatura (float, °C)
   constexpr uint8_t REG_STATUS        = 0x20;
+
 
   // Flags de error (mismos bits que en el slave)
   constexpr uint8_t ERR_CHECKSUM      = 0x01;  // bit0
@@ -44,7 +46,9 @@ namespace LevelSensorMaster {
   float readRawDistance();        // REG_DIST_RAW
   float readMinLevel();
   float readMaxLevel();
+  float readTemperature();        // <<< NUEVO: REG_TEMP
   uint8_t readStatus();
+
 
   bool writeMinLevel(float cm);
   bool writeMaxLevel(float cm);
@@ -54,6 +58,7 @@ namespace LevelSensorMaster {
                float &distRaw,
                float &minLevel,
                float &maxLevel,
+               float &tempC,
                uint8_t &status);
 
   // Devuelve una descripción legible del status

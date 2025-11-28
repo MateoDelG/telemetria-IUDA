@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include "UltrasonicA02YYUW.h"
+#include "DS18B20_manager.h"
 #include "WiFiConfigManager.h"
 #include "ConfigPortal.h"
 #include "Globals.h"
@@ -25,7 +26,12 @@ static uint8_t g_lastSensorStatus = 0xFF;  // valor imposible inicial para forza
 
 
 // Sensor UART
-UltrasonicA02YYUW sensor(Serial1, 3, 4);
+#define RX_PIN 3
+#define TX_PIN 4
+UltrasonicA02YYUW sensor(Serial1, RX_PIN, TX_PIN);
+// Sensor temperatura DS18B20
+#define TEMP_SENSOR_PIN 10
+DS18B20Manager thermo(TEMP_SENSOR_PIN, 12);
 
 // Manejo WiFi / Portal
 WiFiConfigManager wifiCfg;
@@ -53,6 +59,10 @@ void readDistance();
 void updateLevelOutputs();
 void monitorConfigChanges();
 void printSensorStatusIfChanged();
+void initThermo();
+float readThermo();
+
+
 
 void setup() {
   Serial.begin(115200);
@@ -62,6 +72,8 @@ void setup() {
   setupOutputs();
   // Inicializar sensor
   setupDistance();
+  // Inicializar sensor temperatura
+  initThermo();
   // Inicializar esclavo I2C
   setupSlaveI2C();
 
@@ -89,6 +101,7 @@ void loop() {
   if (now - g_lastSampleMs >= (unsigned long)sp) {
     g_lastSampleMs = now;
     readDistance();                  // actualizar Globals con lecturas
+    readThermo();                  // leer temperatura y mostrar por Serial
     printSensorStatusIfChanged();
     updateLevelOutputs();            // actualizar salidas digitales
   }
@@ -111,6 +124,7 @@ void setupSlaveI2C() {
     I2CSlaveManager::begin(addr);
     Serial.println("[MAIN] Dispositivo iniciado como esclavo I2C");
 }
+
 void i2cUpdate() {
   float fr = Globals::getDistanceFiltered();
   float rr = Globals::getDistanceRaw();
@@ -121,7 +135,6 @@ void i2cUpdate() {
   // debug opcional:
   Serial.printf("[I2CUpdate] Filt=%.2f  Raw=%.2f\n", fr, rr);
 }
-
 
 // ------------------------------------------
 // Configuración inicial del sensor y Kalman
@@ -166,6 +179,28 @@ void readDistance() {
     // Serial.printf(">Crudo: %.2f  | Filtrado: %.2f\n", raw, filt);
   }
 }
+
+void initThermo() {
+  uint8_t n = thermo.begin();
+  Serial.println("DS18B20 encontrados: " + String(n));
+}
+
+float readThermo() {
+  if (thermo.sensorCount() == 0) {
+    Serial.println("Sin sensores");
+    return -1;
+  }
+  float c = thermo.readC(0);
+  if (isnan(c)) {
+    Serial.println("Lectura inválida");
+    return -1;
+  } else {
+    // Serial.printf("T0: %.2f °C\n", c);
+    Globals::setTemperature(c);
+    return c;
+  }
+}
+
 
 // ------------------------------------------
 // Activar salidas según niveles configurados

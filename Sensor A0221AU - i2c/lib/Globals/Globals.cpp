@@ -17,6 +17,7 @@ namespace Globals {
 
   static float distanceRaw = NAN;
   static float distanceFiltered = NAN;
+  static float temperature = NAN;
 
   static uint8_t sensorStatus = 0;
 
@@ -43,6 +44,9 @@ namespace Globals {
 
   void setDistanceFiltered(float v) { distanceFiltered = v; }
   float getDistanceFiltered()       { return distanceFiltered; }
+
+  void setTemperature(float v)        { temperature = v; }
+  float getTemperature()              { return temperature; }
 
   void setSensorStatus(uint8_t s) { sensorStatus = s; }
   uint8_t getSensorStatus()       { return sensorStatus; }

@@ -12,6 +12,9 @@ namespace Globals {
   void setDistanceFiltered(float v);
   float getDistanceFiltered();
   
+  void setTemperature(float v);
+  float getTemperature();
+  
 // ---- Estado del sensor (bits) ----
   void setSensorStatus(uint8_t s);
   uint8_t getSensorStatus();
