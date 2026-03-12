@@ -10,5 +10,6 @@
         "memory": "cpp",
         "random": "cpp",
         "initializer_list": "cpp"
-    }
+    },
+    "cmake.sourceDirectory": "D:/Teo/IUDigital/telemetria-IUDA/PH-O2-v2_firmware/lib/Adafruit_BusIO-master"
 }
