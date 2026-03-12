@@ -30,17 +30,22 @@ private:
 
 class RemoteAccessManager {
 public:
+    using LogHook = void (*)(const String& message);
+
     RemoteAccessManager(const char* hostname = "BeansIOT_LAB");
 
     void begin();
     void handle();
     void log(const String& message);
+    void setLogHook(LogHook hook);
 
 private:
     const char* _hostname;
 
     WiFiServer _telnetServer;
     WiFiClient _telnetClient;
+
+    LogHook _logHook = nullptr;
 
     void setupTelnet();
     void setupOTA();

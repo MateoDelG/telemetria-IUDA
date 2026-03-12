@@ -1,0 +1,539 @@
+#include "WebPortalManager.h"
+
+#include <WiFi.h>
+
+static const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PH-O2 Portal</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #111827;
+      --panel-2: #0b1220;
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --bad: #ef4444;
+      --accent: #38bdf8;
+      --border: #1f2937;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      background: radial-gradient(1000px 400px at 10% -10%, #1e293b, transparent), var(--bg);
+      color: var(--text);
+    }
+    header {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(90deg, #0b1220, #111827);
+    }
+    header h1 {
+      margin: 0;
+      font-size: 18px;
+      letter-spacing: 0.5px;
+    }
+    main {
+      padding: 16px;
+      display: grid;
+      gap: 16px;
+    }
+    .grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+      min-height: 84px;
+    }
+    .card h3 {
+      margin: 0 0 8px 0;
+      font-size: 13px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .value {
+      font-size: 24px;
+      font-weight: 700;
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 6px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .pill {
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+    }
+    .led {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+      margin-right: 6px;
+      background: var(--bad);
+      box-shadow: 0 0 6px rgba(239,68,68,0.6);
+    }
+    .led.ok {
+      background: var(--ok);
+      box-shadow: 0 0 6px rgba(34,197,94,0.6);
+    }
+    .btns {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    button {
+      background: #111827;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px 12px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    button.primary { border-color: var(--accent); }
+    button.warn { border-color: var(--warn); }
+    button.bad { border-color: var(--bad); }
+    .console {
+      background: #0b1020;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px;
+      min-height: 160px;
+      max-height: 260px;
+      overflow: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre-wrap;
+    }
+    .muted { color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>PH-O2 Portal</h1>
+  </header>
+  <main>
+    <div class="grid">
+      <div class="card">
+        <h3>pH</h3>
+        <div class="value" id="phValue">--</div>
+        <div class="row"><span class="muted">Temp</span><span id="tempValue">--</span></div>
+      </div>
+      <div class="card">
+        <h3>Modo</h3>
+        <div class="value" id="autoState">--</div>
+        <div class="row"><span class="muted">Ultimo</span><span id="lastResult">--</span></div>
+      </div>
+      <div class="card">
+        <h3>WiFi</h3>
+        <div class="value" id="ipValue">--</div>
+        <div class="row"><span class="muted">RSSI</span><span id="rssiValue">--</span></div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h3>Niveles</h3>
+        <div class="row"><span><span class="led" id="lvlO2"></span>O2</span><span id="lvlO2Text">--</span></div>
+        <div class="row"><span><span class="led" id="lvlPH"></span>pH</span><span id="lvlPHText">--</span></div>
+        <div class="row"><span><span class="led" id="lvlH2O"></span>H2O</span><span id="lvlH2OText">--</span></div>
+        <div class="row"><span><span class="led" id="lvlKCL"></span>KCL</span><span id="lvlKCLText">--</span></div>
+      </div>
+      <div class="card">
+        <h3>Bombas</h3>
+        <div class="row"><span><span class="led" id="pKCL"></span>KCL</span><span id="pKCLText">--</span></div>
+        <div class="row"><span><span class="led" id="pH2O"></span>H2O</span><span id="pH2OText">--</span></div>
+        <div class="row"><span><span class="led" id="pDrain"></span>DRAIN</span><span id="pDrainText">--</span></div>
+        <div class="row"><span><span class="led" id="pMixer"></span>MIXER</span><span id="pMixerText">--</span></div>
+      </div>
+      <div class="card">
+        <h3>Acciones</h3>
+        <div class="btns">
+          <button class="primary" onclick="doAction('auto_start')">Auto start</button>
+          <button class="warn" onclick="doAction('auto_cancel')">Auto cancel</button>
+          <button onclick="doAction('read_ph')">Leer pH</button>
+          <button onclick="doAction('read_temp')">Leer temp</button>
+          <button class="bad" onclick="doAction('clear_logs')">Limpiar consola</button>
+        </div>
+        <div class="btns" style="margin-top:10px;">
+          <button id="btn-kcl" onclick="togglePump('kcl')">KCL</button>
+          <button id="btn-h2o" onclick="togglePump('h2o')">H2O</button>
+          <button id="btn-drain" onclick="togglePump('drain')">DRAIN</button>
+          <button id="btn-mixer" onclick="togglePump('mixer')">MIXER</button>
+          <button id="btn-s1" onclick="togglePump('s1')">S1</button>
+          <button id="btn-s2" onclick="togglePump('s2')">S2</button>
+          <button id="btn-s3" onclick="togglePump('s3')">S3</button>
+          <button id="btn-s4" onclick="togglePump('s4')">S4</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Tiempos</h3>
+      <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));">
+        <label>KCL fill (s)<br><input id="t-kcl" type="number" min="0" step="1"></label>
+        <label>H2O fill (s)<br><input id="t-h2o" type="number" min="0" step="1"></label>
+        <label>Sample fill (s)<br><input id="t-sample" type="number" min="0" step="1"></label>
+        <label>Drain (s)<br><input id="t-drain" type="number" min="0" step="1"></label>
+        <label>Sample timeout (s)<br><input id="t-sample-timeout" type="number" min="0" step="1"></label>
+        <label>Drain timeout (s)<br><input id="t-drain-timeout" type="number" min="0" step="1"></label>
+        <label>Estabilizacion (s)<br><input id="t-stab" type="number" min="0" step="1"></label>
+        <label>Samples (0-4)<br><input id="t-sample-count" type="number" min="0" max="4" step="1"></label>
+      </div>
+      <div class="btns" style="margin-top:10px;">
+        <button onclick="loadTimes()">Obtener tiempos actuales</button>
+        <button class="primary" onclick="saveTimes()">Guardar tiempos</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Consola</h3>
+      <div class="console" id="consoleBox">--</div>
+    </div>
+  </main>
+
+  <script>
+    async function fetchStatus() {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+
+        document.getElementById('phValue').textContent = Number.isFinite(data.ph) ? data.ph.toFixed(3) : '--';
+        document.getElementById('tempValue').textContent = Number.isFinite(data.temp_c) ? (data.temp_c.toFixed(1) + ' C') : '--';
+        document.getElementById('autoState').textContent = data.auto_running ? 'AUTO' : 'MANUAL';
+        document.getElementById('lastResult').textContent = data.last_result || '--';
+
+        document.getElementById('ipValue').textContent = data.ip || '--';
+        document.getElementById('rssiValue').textContent = (data.rssi !== null && data.rssi !== undefined) ? (data.rssi + ' dBm') : '--';
+
+        setLevel('lvlO2', 'lvlO2Text', data.levels?.o2);
+        setLevel('lvlPH', 'lvlPHText', data.levels?.ph);
+        setLevel('lvlH2O', 'lvlH2OText', data.levels?.h2o);
+        setLevel('lvlKCL', 'lvlKCLText', data.levels?.kcl);
+
+        setLevel('pKCL', 'pKCLText', data.pumps?.kcl);
+        setLevel('pH2O', 'pH2OText', data.pumps?.h2o);
+        setLevel('pDrain', 'pDrainText', data.pumps?.drain);
+        setLevel('pMixer', 'pMixerText', data.pumps?.mixer);
+        setPumpBtn('btn-kcl', data.pumps?.kcl);
+        setPumpBtn('btn-h2o', data.pumps?.h2o);
+        setPumpBtn('btn-drain', data.pumps?.drain);
+        setPumpBtn('btn-mixer', data.pumps?.mixer);
+        setPumpBtn('btn-s1', data.pumps?.s1);
+        setPumpBtn('btn-s2', data.pumps?.s2);
+        setPumpBtn('btn-s3', data.pumps?.s3);
+        setPumpBtn('btn-s4', data.pumps?.s4);
+
+      } catch (e) {
+        console.log('status err', e);
+      }
+    }
+
+    async function fetchLogs() {
+      try {
+        const res = await fetch('/api/logs');
+        const data = await res.json();
+        const lines = data.lines || [];
+        document.getElementById('consoleBox').textContent = lines.join('\n');
+      } catch (e) {
+        console.log('logs err', e);
+      }
+    }
+
+    async function doAction(action, value) {
+      try {
+        const body = value ? ('action=' + encodeURIComponent(action) + '&value=' + encodeURIComponent(value))
+                           : ('action=' + encodeURIComponent(action));
+        const res = await fetch('/api/action', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: body
+        });
+        await res.json();
+        fetchStatus();
+        fetchLogs();
+      } catch (e) {
+        console.log('action err', e);
+      }
+    }
+
+    function togglePump(id) {
+      doAction('toggle_pump', id);
+    }
+
+    function setInput(id, val) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      if (val === null || val === undefined) return;
+      el.value = val;
+    }
+
+    async function loadTimes() {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        if (data.times) {
+          setInput('t-kcl', data.times.kcl_fill_s);
+          setInput('t-h2o', data.times.h2o_fill_s);
+          setInput('t-sample', data.times.sample_fill_s);
+          setInput('t-drain', data.times.drain_s);
+          setInput('t-sample-timeout', data.times.sample_timeout_s);
+          setInput('t-drain-timeout', data.times.drain_timeout_s);
+          setInput('t-stab', data.times.stabilization_s);
+          setInput('t-sample-count', data.times.sample_count);
+        }
+      } catch (e) {
+        console.log('times err', e);
+      }
+    }
+
+    function saveTimes() {
+      const payload = {
+        kcl_fill_s: Number(document.getElementById('t-kcl').value || 0),
+        h2o_fill_s: Number(document.getElementById('t-h2o').value || 0),
+        sample_fill_s: Number(document.getElementById('t-sample').value || 0),
+        drain_s: Number(document.getElementById('t-drain').value || 0),
+        sample_timeout_s: Number(document.getElementById('t-sample-timeout').value || 0),
+        drain_timeout_s: Number(document.getElementById('t-drain-timeout').value || 0),
+        stabilization_s: Number(document.getElementById('t-stab').value || 0),
+        sample_count: Number(document.getElementById('t-sample-count').value || 0)
+      };
+      doAction('set_times', JSON.stringify(payload));
+    }
+
+    function setLevel(ledId, textId, on) {
+      const led = document.getElementById(ledId);
+      const txt = document.getElementById(textId);
+      const ok = !!on;
+      if (ok) led.classList.add('ok'); else led.classList.remove('ok');
+      txt.textContent = ok ? 'ON' : 'OFF';
+    }
+
+    function setPumpBtn(btnId, on) {
+      const btn = document.getElementById(btnId);
+      if (!btn) return;
+      if (on) {
+        btn.classList.add('primary');
+      } else {
+        btn.classList.remove('primary');
+      }
+    }
+
+    fetchStatus();
+    fetchLogs();
+    setInterval(fetchStatus, 1500);
+    setInterval(fetchLogs, 2000);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+WebPortalManager::WebPortalManager(PumpsManager* pumps,
+                                   LevelSensorsManager* levels,
+                                   UartProto::UARTManager* uart,
+                                   ConfigStore* eeprom)
+  : server_(80), pumps_(pumps), levels_(levels), uart_(uart), eeprom_(eeprom) {}
+
+bool WebPortalManager::begin() {
+  if (started_) return true;
+
+  server_.on("/", HTTP_GET, [this]() { handleIndex_(); });
+  server_.on("/api/status", HTTP_GET, [this]() { handleStatus_(); });
+  server_.on("/api/logs", HTTP_GET, [this]() { handleLogs_(); });
+  server_.on("/api/action", HTTP_GET, [this]() { handleAction_(); });
+  server_.on("/api/action", HTTP_POST, [this]() { handleAction_(); });
+  server_.onNotFound([this]() {
+    server_.send(404, "text/plain", "Not Found");
+  });
+
+  server_.begin();
+  started_ = true;
+  return true;
+}
+
+void WebPortalManager::loop() {
+  if (!started_) return;
+  server_.handleClient();
+}
+
+void WebPortalManager::setActionHandler(ActionHandler handler) {
+  actionHandler_ = handler;
+}
+
+void WebPortalManager::log(const String& line) {
+  addLogLine_(line);
+}
+
+void WebPortalManager::clearLogs() {
+  logHead_ = 0;
+  logCount_ = 0;
+}
+
+void WebPortalManager::handleIndex_() {
+  server_.send_P(200, "text/html", INDEX_HTML);
+}
+
+void WebPortalManager::handleStatus_() {
+  JsonDocument doc;
+
+  float lastPh = NAN;
+  float lastTemp = NAN;
+  bool autoRun = false;
+  String lastResult;
+
+  if (uart_) {
+    lastPh = uart_->getLastPh();
+    lastTemp = uart_->getLastTempC();
+    autoRun = uart_->getAutoRunning();
+    lastResult = uart_->getLastResult();
+  }
+
+  if (isfinite(lastPh)) {
+    doc["ph"] = lastPh;
+  } else {
+    doc["ph"] = nullptr;
+  }
+  if (isfinite(lastTemp)) {
+    doc["temp_c"] = lastTemp;
+  } else {
+    doc["temp_c"] = nullptr;
+  }
+  doc["auto_running"] = autoRun;
+  doc["last_result"] = lastResult;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    doc["ip"] = WiFi.localIP().toString();
+    doc["rssi"] = WiFi.RSSI();
+  } else {
+    doc["ip"] = "";
+    doc["rssi"] = nullptr;
+  }
+
+  JsonObject levels = doc["levels"].to<JsonObject>();
+  if (levels_) {
+    levels["o2"] = levels_->o2();
+    levels["ph"] = levels_->ph();
+    levels["h2o"] = levels_->h2o();
+    levels["kcl"] = levels_->kcl();
+  } else {
+    levels["o2"] = false;
+    levels["ph"] = false;
+    levels["h2o"] = false;
+    levels["kcl"] = false;
+  }
+
+  JsonObject pumps = doc["pumps"].to<JsonObject>();
+  if (pumps_) {
+    pumps["kcl"] = pumps_->isOn(PumpId::KCL);
+    pumps["h2o"] = pumps_->isOn(PumpId::H2O);
+    pumps["drain"] = pumps_->isOn(PumpId::DRAIN);
+    pumps["mixer"] = pumps_->isOn(PumpId::MIXER);
+    pumps["s1"] = pumps_->isOn(PumpId::SAMPLE1);
+    pumps["s2"] = pumps_->isOn(PumpId::SAMPLE2);
+    pumps["s3"] = pumps_->isOn(PumpId::SAMPLE3);
+    pumps["s4"] = pumps_->isOn(PumpId::SAMPLE4);
+  } else {
+    pumps["kcl"] = false;
+    pumps["h2o"] = false;
+    pumps["drain"] = false;
+    pumps["mixer"] = false;
+    pumps["s1"] = false;
+    pumps["s2"] = false;
+    pumps["s3"] = false;
+    pumps["s4"] = false;
+  }
+
+  if (eeprom_) {
+    JsonObject times = doc["times"].to<JsonObject>();
+    times["kcl_fill_s"] = (uint32_t)(eeprom_->kclFillMs() / 1000UL);
+    times["h2o_fill_s"] = (uint32_t)(eeprom_->h2oFillMs() / 1000UL);
+    times["sample_fill_s"] = (uint32_t)(eeprom_->sampleFillMs() / 1000UL);
+    times["drain_s"] = (uint32_t)(eeprom_->drainMs() / 1000UL);
+    times["sample_timeout_s"] = (uint32_t)(eeprom_->sampleTimeoutMs() / 1000UL);
+    times["drain_timeout_s"] = (uint32_t)(eeprom_->drainTimeoutMs() / 1000UL);
+    times["stabilization_s"] = (uint32_t)(eeprom_->stabilizationMs() / 1000UL);
+    times["sample_count"] = (uint32_t)eeprom_->sampleCount();
+  }
+
+  sendJson_(doc);
+}
+
+void WebPortalManager::handleLogs_() {
+  JsonDocument doc;
+  JsonArray arr = doc["lines"].to<JsonArray>();
+
+  for (size_t i = 0; i < logCount_; ++i) {
+    size_t idx = (logHead_ + kLogLines - logCount_ + i) % kLogLines;
+    arr.add(logs_[idx]);
+  }
+
+  sendJson_(doc);
+}
+
+void WebPortalManager::handleAction_() {
+  String action = server_.arg("action");
+  String value = server_.arg("value");
+
+  JsonDocument doc;
+  if (action.isEmpty()) {
+    doc["ok"] = false;
+    doc["message"] = "missing action";
+    sendJson_(doc);
+    return;
+  }
+
+  if (action == "clear_logs") {
+    clearLogs();
+    doc["ok"] = true;
+    doc["message"] = "logs cleared";
+    sendJson_(doc);
+    return;
+  }
+
+  if (actionHandler_) {
+    String msg;
+    bool ok = actionHandler_(action, value, msg);
+    doc["ok"] = ok;
+    doc["message"] = msg;
+    sendJson_(doc);
+    return;
+  }
+
+  doc["ok"] = false;
+  doc["message"] = "no handler";
+  sendJson_(doc);
+}
+
+void WebPortalManager::addLogLine_(const String& line) {
+  String trimmed = line;
+  if (trimmed.length() > 120) trimmed = trimmed.substring(0, 120);
+  logs_[logHead_] = trimmed;
+  logHead_ = (logHead_ + 1) % kLogLines;
+  if (logCount_ < kLogLines) ++logCount_;
+}
+
+void WebPortalManager::sendJson_(JsonDocument& doc) {
+  String out;
+  serializeJson(doc, out);
+  server_.send(200, "application/json", out);
+}

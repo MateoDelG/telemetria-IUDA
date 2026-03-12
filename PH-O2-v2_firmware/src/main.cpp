@@ -6,6 +6,8 @@
 #include "level_sensors_manager.h"
 #include "test_board.h"
 #include "uart_manager.h"
+#include "WebPortalManager.h"
+#include <ArduinoJson.h>
 #include <Arduino.h>
 #include <globals.h>
 
@@ -22,6 +24,9 @@ PumpsManager pumps;
 PHManager ph(&ads, /*channel=*/0, /*avgSamples=*/6);
 ConfigStore eeprom;
 LevelSensorsManager levels; 
+WebPortalManager webPortal(&pumps, &levels, &uart2, &eeprom);
+
+volatile bool autoCancelRequest = false;
 
 bool startProcess = false;
 
@@ -37,6 +42,8 @@ void initPumps();
 float readThermo();
 float readADC();
 float readPH();
+static void webLogHook(const String& message);
+static bool handleWebAction(const String& action, const String& value, String& outMessage);
 
 void APIUI();
 static void MenuDemoTick();
@@ -103,6 +110,7 @@ void taskCore1(void *pvParameters) {
   for (;;) {
     wifiManager.loop();
     remoteManager.handle();
+    webPortal.loop();
     uart2.loop();
     vTaskDelay(200 / portTICK_PERIOD_MS); // Espera 100 ms
   }
@@ -143,6 +151,10 @@ void initWiFi() {
   wifiManager.begin();
   if (wifiManager.isConnected()) {
     remoteManager.begin(); // Solo si hay WiFi
+    remoteManager.setLogHook(webLogHook);
+    webPortal.setActionHandler(handleWebAction);
+    webPortal.begin();
+    webPortal.log(String("Web portal listo en http://") + wifiManager.getLocalIP().toString());
   }
 }
 
@@ -330,6 +342,105 @@ float readPH() {
 
   uart2.setLastPh(phValue);
   return phValue;
+}
+
+static void webLogHook(const String& message) {
+  webPortal.log(message);
+}
+
+static bool handleWebAction(const String& action, const String& value, String& outMessage) {
+  (void)value;
+  if (action == "auto_start") {
+    uart2.setAutoMeasureRequested(true);
+    outMessage = "auto requested";
+    return true;
+  }
+  if (action == "auto_cancel") {
+    autoCancelRequest = true;
+    outMessage = "auto cancel requested";
+    return true;
+  }
+  if (action == "read_ph") {
+    float v = readPH();
+    outMessage = String("ph=") + String(v, 2);
+    return true;
+  }
+  if (action == "read_temp") {
+    float t = readThermo();
+    outMessage = String("temp=") + String(t, 1);
+    return true;
+  }
+  if (action == "toggle_pump") {
+    PumpId id;
+    bool ok = true;
+    if      (value == "kcl")   id = PumpId::KCL;
+    else if (value == "h2o")   id = PumpId::H2O;
+    else if (value == "drain") id = PumpId::DRAIN;
+    else if (value == "mixer") id = PumpId::MIXER;
+    else if (value == "s1")    id = PumpId::SAMPLE1;
+    else if (value == "s2")    id = PumpId::SAMPLE2;
+    else if (value == "s3")    id = PumpId::SAMPLE3;
+    else if (value == "s4")    id = PumpId::SAMPLE4;
+    else ok = false;
+
+    if (!ok) {
+      outMessage = "invalid pump";
+      return false;
+    }
+
+    bool nowOn = !pumps.isOn(id);
+    pumps.set(id, nowOn);
+    outMessage = String("pump ") + value + (nowOn ? " on" : " off");
+    webPortal.log(outMessage);
+    return true;
+  }
+  if (action == "set_times") {
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, value);
+    if (err) {
+      outMessage = "invalid json";
+      return false;
+    }
+
+    auto readU = [&](const char* key, uint32_t def) -> uint32_t {
+      if (!doc.containsKey(key)) return def;
+      long v = doc[key].as<long>();
+      if (v < 0) v = 0;
+      return (uint32_t)v;
+    };
+    auto readSampleCount = [&](const char* key, uint8_t def) -> uint8_t {
+      if (!doc.containsKey(key)) return def;
+      long v = doc[key].as<long>();
+      if (v < 0) v = 0;
+      if (v > 4) v = 4;
+      return (uint8_t)v;
+    };
+
+    uint32_t kclFill = readU("kcl_fill_s", (uint32_t)(eeprom.kclFillMs() / 1000UL));
+    uint32_t h2oFill = readU("h2o_fill_s", (uint32_t)(eeprom.h2oFillMs() / 1000UL));
+    uint32_t sampleFill = readU("sample_fill_s", (uint32_t)(eeprom.sampleFillMs() / 1000UL));
+    uint32_t drain = readU("drain_s", (uint32_t)(eeprom.drainMs() / 1000UL));
+    uint32_t sampleTimeout = readU("sample_timeout_s", (uint32_t)(eeprom.sampleTimeoutMs() / 1000UL));
+    uint32_t drainTimeout = readU("drain_timeout_s", (uint32_t)(eeprom.drainTimeoutMs() / 1000UL));
+    uint32_t stab = readU("stabilization_s", (uint32_t)(eeprom.stabilizationMs() / 1000UL));
+    uint8_t sampleCount = readSampleCount("sample_count", (uint8_t)eeprom.sampleCount());
+
+    eeprom.setKclFillMs(kclFill * 1000UL);
+    eeprom.setH2oFillMs(h2oFill * 1000UL);
+    eeprom.setSampleFillMs(sampleFill * 1000UL);
+    eeprom.setDrainMs(drain * 1000UL);
+    eeprom.setSampleTimeoutMs(sampleTimeout * 1000UL);
+    eeprom.setDrainTimeoutMs(drainTimeout * 1000UL);
+    eeprom.setStabilizationMs(stab * 1000UL);
+    eeprom.setSampleCount(sampleCount);
+    eeprom.save();
+
+    outMessage = "times saved";
+    webPortal.log(outMessage);
+    return true;
+  }
+  outMessage = "unknown action";
+  return false;
 }
 
 static bool runADSCalibration_0V_3p31V(uint8_t channel = 0,
@@ -1600,6 +1711,15 @@ static bool AutoModeTick() {
     Buttons::BTN_ESC.reset();
     pumps.allOff();
     lcd.splash("AUTO cancelado", "", 800);
+    started = false; idx = 0; phase = Phase::ENTER; lastPHShown = NAN;
+    currentSample = 0; totalSamples = 0;
+    return true;
+  }
+
+  if (autoCancelRequest) {
+    autoCancelRequest = false;
+    pumps.allOff();
+    lcd.splash("AUTO cancelado", "web", 800);
     started = false; idx = 0; phase = Phase::ENTER; lastPHShown = NAN;
     currentSample = 0; totalSamples = 0;
     return true;

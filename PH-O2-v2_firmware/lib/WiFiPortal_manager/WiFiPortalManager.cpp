@@ -86,9 +86,16 @@ void RemoteAccessManager::handle() {
 
 void RemoteAccessManager::log(const String& message) {
     Serial.println(message);
+    if (_logHook) {
+        _logHook(message);
+    }
     if (_telnetClient && _telnetClient.connected()) {
         _telnetClient.println(message);
     }
+}
+
+void RemoteAccessManager::setLogHook(LogHook hook) {
+    _logHook = hook;
 }
 
 void RemoteAccessManager::setupTelnet() {
