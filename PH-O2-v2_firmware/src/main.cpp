@@ -1491,7 +1491,7 @@ static bool ManualLevelsTick() {
   static int8_t lastH2O = -1;
 
   auto readAndRender = [&](bool force = false) {
-    // Activo = HIGH (pull-ups externas). Mantenemos convención "BAJO" cuando está activo.
+  // Activo = HIGH (pull-ups externas).
     const bool o2  = levels.o2();   // true → activo → "BAJO"
     const bool ph  = levels.ph();
     const bool kcl = levels.kcl();
@@ -1513,10 +1513,10 @@ static bool ManualLevelsTick() {
       // Formato compacto para 16x2:
       // L0: "O2:XXX  pH:XXX"
       // L1: "H2O:XXX KCL:XXX"
-      const char* sO2  = o2  ? "LOW" : "OK ";
-      const char* sPH  = ph  ? "LOW" : "OK ";
-      const char* sH2O = h2o ? "LOW" : "OK ";
-      const char* sKCL = kcl ? "LOW" : "OK ";
+      const char* sO2  = o2  ? "HI " : "LO ";
+      const char* sPH  = ph  ? "HI " : "LO ";
+      const char* sH2O = h2o ? "HI " : "LO ";
+      const char* sKCL = kcl ? "HI " : "LO ";
 
       char l0[17], l1[17];
       snprintf(l0, sizeof(l0), "O2:%s  pH:%s",  sO2,  sPH);
@@ -1561,7 +1561,7 @@ static bool ManualLevelsTick() {
 static bool AutoModeTick() {
   extern PumpsManager           pumps;
   extern ConfigStore            eeprom;
-  extern LevelSensorsManager    levels;     // O2/PH/KCL/H2O (pull-up externas, activo=HIGH)
+  extern LevelSensorsManager    levels;     // O2/PH/H2O (pull-up externas, activo=HIGH)
   extern float                  readPH();
   extern float                  readThermo();
   extern UartProto::UARTManager uart2;      // para registrar pH por sample
@@ -1612,27 +1612,25 @@ static bool AutoModeTick() {
   };
 
   // Fill (fase 2: mantener encendida)
-  auto getKclFillMs    = [&](){ return eeprom.kclFillMs();    };
   auto getH2oFillMs    = [&](){ return eeprom.h2oFillMs();    };
   auto getSampleFillMs = [&](){ return eeprom.sampleFillMs(); };
   auto getDrainMs      = [&](){ return eeprom.drainMs();      };
 
   auto computeFillMs = [&](PumpId id) -> uint32_t {
     switch (id) {
-      case PumpId::KCL:     return getKclFillMs();
       case PumpId::H2O:     return getH2oFillMs();
       case PumpId::SAMPLE1:
       case PumpId::SAMPLE2:
       case PumpId::SAMPLE3:
       case PumpId::SAMPLE4: return getSampleFillMs();
-      case PumpId::DRAIN:   return getDrainMs();
+      case PumpId::DRAIN:   return getDrainTimeoutMs();
       default:              return 0;
     }
   };
 
   // ---------- Receta ----------
   static const Step STEPS[] = {
-    { Op::READ_LEVELS, PumpId::KCL,     DurKind::CONST,        0, "Lee niveles" },
+    { Op::READ_LEVELS, PumpId::H2O,     DurKind::CONST,        0, "Lee niveles" },
     { Op::PUMP_FOR,    PumpId::DRAIN,   DurKind::DRAIN_T,      0, "Drenando"    },
     { Op::PUMP_FOR,    PumpId::SAMPLE1, DurKind::SAMPLE_T,     0, "Sample"      }, // SAMPLE dinámico
     { Op::MIXER_ON,    PumpId::MIXER,   DurKind::CONST,        0, "Mixer ON"    },
@@ -1640,10 +1638,9 @@ static bool AutoModeTick() {
     { Op::MIXER_OFF,   PumpId::MIXER,   DurKind::CONST,        0, "Mixer OFF"   },
     { Op::READ_PH,     PumpId::MIXER,   DurKind::CONST,        0, "Leer pH"     },
     { Op::PUMP_FOR,    PumpId::DRAIN,   DurKind::DRAIN_T,      0, "Drenando"    },
-    // H2O/KCL: SIN sensores ni timeout → sólo FILL ascendente
-    { Op::PUMP_FOR,    PumpId::H2O,     DurKind::CONST,        0, "H2O"         },
-    { Op::PUMP_FOR,    PumpId::KCL,     DurKind::CONST,        0, "KCL"         },
-    { Op::END,         PumpId::KCL,     DurKind::CONST,        0, "FIN"         },
+    // H2O: espera pH HIGH con timeout y luego FILL ascendente
+    { Op::PUMP_FOR,    PumpId::H2O,     DurKind::SAMPLE_T,     0, "H2O"         },
+    { Op::END,         PumpId::H2O,     DurKind::CONST,        0, "FIN"         },
   };
   static const uint8_t N_STEPS = sizeof(STEPS)/sizeof(STEPS[0]);
 
@@ -1725,18 +1722,18 @@ static bool AutoModeTick() {
     return true;
   }
 
-  // ---------- Precondición: H2O y KCL en OK (LOW) ----------
+  // ---------- Precondición: H2O debe estar en HIGH ----------
   if (!started) {
-    const bool h2o = levels.h2o();  // HIGH=activo
-    const bool kcl = levels.kcl();  // HIGH=activo
-    if (h2o || kcl) {
-      const char* sH2O = h2o ? "ACT" : "OK ";
-      const char* sKCL = kcl ? "ACT" : "OK ";
-      const char* sO2  = levels.o2() ? "ACT" : "OK ";
-      const char* sPH  = levels.ph() ? "ACT" : "OK ";
+    const bool h2oHigh = levels.h2o();
+    const bool phHigh  = levels.ph();
+    const bool o2High  = levels.o2();
+    if (!h2oHigh) {
+      const char* sH2O = h2oHigh ? "HI " : "LO ";
+      const char* sPH  = phHigh  ? "HI " : "LO ";
+      const char* sO2  = o2High  ? "HI " : "LO ";
       char L0[17], L1[17];
-      snprintf(L0, sizeof(L0), "H2O:%s KCL:%s", sH2O, sKCL);
-      snprintf(L1, sizeof(L1), "O2:%s  pH:%s",  sO2,  sPH);
+      snprintf(L0, sizeof(L0), "H2O:%s pH:%s", sH2O, sPH);
+      snprintf(L1, sizeof(L1), "O2:%s", sO2);
       show(L0, L1);
       return false;
     }
@@ -1756,13 +1753,12 @@ static bool AutoModeTick() {
   // ---------- Sensor alcanzado? ----------
   auto sensorReached = [&](PumpId pump) -> bool {
     switch (pump) {
-      case PumpId::KCL:     return false; // (1) NO dependen de sensores
-      case PumpId::H2O:     return false; // (1) NO dependen de sensores
+      case PumpId::H2O:     return levels.ph();
       case PumpId::SAMPLE1:
       case PumpId::SAMPLE2:
       case PumpId::SAMPLE3:
-      case PumpId::SAMPLE4: return (!levels.o2() && !levels.ph()); // ambos ACTIVOS
-      case PumpId::DRAIN:   return (levels.o2() && levels.ph());   // ambos INACTIVOS
+      case PumpId::SAMPLE4: return levels.ph();
+      case PumpId::DRAIN:   return !levels.ph();
       default:              return false;
     }
   };
@@ -1773,17 +1769,15 @@ static bool AutoModeTick() {
   switch (S.op) {
     case Op::READ_LEVELS: {
       if (phase == Phase::ENTER) {
-        const bool h2o = levels.h2o();
-        const bool kcl = levels.kcl();
-        const bool o2  = levels.o2();
-        const bool ph  = levels.ph();
-        const char* sH2O = h2o ? "ACT" : "OK ";
-        const char* sKCL = kcl ? "ACT" : "OK ";
-        const char* sO2  = o2  ? "ACT" : "OK ";
-        const char* sPH  = ph  ? "ACT" : "OK ";
+        const bool h2oHigh = levels.h2o();
+        const bool phHigh  = levels.ph();
+        const bool o2High  = levels.o2();
+        const char* sH2O = h2oHigh ? "HI " : "LO ";
+        const char* sPH  = phHigh  ? "HI " : "LO ";
+        const char* sO2  = o2High  ? "HI " : "LO ";
         char L0[17], L1[17];
-        snprintf(L0, sizeof(L0), "H2O:%s KCL:%s", sH2O, sKCL);
-        snprintf(L1, sizeof(L1), "O2:%s  pH:%s",  sO2,  sPH);
+        snprintf(L0, sizeof(L0), "H2O:%s pH:%s", sH2O, sPH);
+        snprintf(L1, sizeof(L1), "O2:%s", sO2);
         show(L0, L1);
         tPost = millis();
         phase = Phase::POST;
@@ -1800,24 +1794,18 @@ static bool AutoModeTick() {
 
       if (phase == Phase::ENTER) {
         timeoutMs = computeTimeoutMs(S.dkind);   // 0 para CONST
+        if (effPump == PumpId::H2O) timeoutMs = getSampleTimeoutMs();
         fillMs    = computeFillMs(effPump);
         if (fillMs == 0) fillMs = 500;           // mínimo
 
         pumps.on(effPump);
 
-        // (1) KCL/H2O no esperan sensor ni tienen timeout → saltar directo a FILL
-        if (effPump == PumpId::KCL || effPump == PumpId::H2O) {
-          pumpSub    = PumpSub::FILL;
-          tFillStart = millis();
-          progressFillUp(S.label, fillMs, tFillStart); // ascendente
-        } else {
-          pumpSub = PumpSub::WAIT_SENSOR;
-          t0      = millis();
-          if (timeoutMs > 0)
-            progressTimeoutCountdown(S.label, timeoutMs, t0); // regresiva
-          else
-            show(S.label, "Esperando sens");
-        }
+        pumpSub = PumpSub::WAIT_SENSOR;
+        t0      = millis();
+        if (timeoutMs > 0)
+          progressTimeoutCountdown(S.label, timeoutMs, t0); // regresiva
+        else
+          show(S.label, "Esperando sens");
 
         phase = Phase::RUN;
       }

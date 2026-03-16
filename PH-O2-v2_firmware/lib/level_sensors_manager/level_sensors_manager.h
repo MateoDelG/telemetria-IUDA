@@ -5,7 +5,7 @@
   level_sensors_manager
   ---------------------
   - Inicializa 4 sensores digitales de nivel con pull-ups EXTERNAS.
-  - Lógica: "activo" = lectura HIGH.
+  - Lógica: O2/pH/KCL/H2O activos en HIGH (inversión aplicada en software).
   - Pines por defecto:
       O2  -> 26
       pH  -> 27

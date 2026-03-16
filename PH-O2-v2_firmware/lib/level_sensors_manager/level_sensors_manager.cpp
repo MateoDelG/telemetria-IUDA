@@ -17,10 +17,10 @@ bool LevelSensorsManager::begin(int pinO2, int pinPH, int pinKCL, int pinH2O) {
 }
 
 // --- Lecturas específicas ---
-bool LevelSensorsManager::o2()  const { return readHigh_(pinO2_);  }
-bool LevelSensorsManager::ph()  const { return readHigh_(pinPH_);  }
-bool LevelSensorsManager::kcl() const { return readHigh_(pinKCL_); }
-bool LevelSensorsManager::h2o() const { return readHigh_(pinH2O_); }
+bool LevelSensorsManager::o2()  const { return !readHigh_(pinO2_); }
+bool LevelSensorsManager::ph()  const { return !readHigh_(pinPH_); }
+bool LevelSensorsManager::kcl() const { return !readHigh_(pinKCL_); }
+bool LevelSensorsManager::h2o() const { return !readHigh_(pinH2O_); }
 
 // --- Lectura genérica por ID ---
 bool LevelSensorsManager::read(LevelSensorId id) const {
