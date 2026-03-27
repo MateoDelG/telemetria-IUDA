@@ -34,6 +34,12 @@ WiFiPortalManager::WiFiPortalManager(const char* apName, const char* apPassword,
     
         // Si el pin está en HIGH: intentar conectar normalmente
         WiFi.mode(WIFI_STA);
+        // Configuración IP fija (defaults)
+        IPAddress localIp(192, 168, 1, 170);
+        IPAddress gateway(192, 168, 1, 1);
+        IPAddress subnet(255, 255, 255, 0);
+        IPAddress dns(192, 168, 1, 1);
+        WiFi.config(localIp, gateway, subnet, dns);
         wm.setConfigPortalBlocking(false);
         bool connected = wm.autoConnect();
     

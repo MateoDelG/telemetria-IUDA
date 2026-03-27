@@ -18,6 +18,7 @@ public:
   void setAutoRunning(bool v);
 
   void setLastPh(float v);
+  void setLastO2(float v);
   void setLastTempC(float v);
   void setLastResult(const String& r);
   void setLastHasData(bool v);
@@ -31,6 +32,7 @@ public:
   bool   getAutoRunning() const;
 
   float  getLastPh() const;
+  float  getLastO2() const;
   float  getLastTempC() const;
   String getLastResult() const;
   bool   getLastHasData() const;
@@ -55,6 +57,7 @@ private:
   volatile bool   autoMeasureRequested_ = false;
 
   volatile float  last_ph_ = 7.0f;
+  volatile float  last_o2_ = NAN;
   volatile float  last_tempC_ = 25.0f;
   String          last_result_ = "OK";
   volatile bool   last_has_data_ = false;

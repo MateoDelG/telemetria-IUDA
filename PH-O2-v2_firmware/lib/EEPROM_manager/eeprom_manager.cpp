@@ -52,7 +52,7 @@ bool ConfigStore::load() {
     return false;
   }
 
-  // Solo aceptamos la versión actual (v7)
+  // Solo aceptamos la versión actual (v8)
   if (version != kVersion) {
     strncpy(_err, "VERSION distinta (no soportada)", sizeof(_err)-1);
     return false;
@@ -106,6 +106,12 @@ void ConfigStore::resetDefaults() {
   _cfg.ph3pt.V7  = NAN;
   _cfg.ph3pt.V10 = NAN;
   _cfg.ph3pt.tC  = NAN;
+
+  // O2 2pt sin calibrar
+  _cfg.o2cal.V1_mV = NAN;
+  _cfg.o2cal.T1_C  = NAN;
+  _cfg.o2cal.V2_mV = NAN;
+  _cfg.o2cal.T2_C  = NAN;
 
   // FILL TIMES por defecto (ms)
   _cfg.kcl_fill_ms    = 3000;
@@ -167,6 +173,26 @@ bool ConfigStore::hasPH2pt() const {
 }
 bool ConfigStore::hasPH3pt() const {
   return !(isnan(_cfg.ph3pt.V4) || isnan(_cfg.ph3pt.V7) || isnan(_cfg.ph3pt.V10));
+}
+
+// ---- O2 2pt ----
+void ConfigStore::setO2Cal(float V1_mV, float T1_C, float V2_mV, float T2_C) {
+  _cfg.o2cal.V1_mV = V1_mV;
+  _cfg.o2cal.T1_C  = T1_C;
+  _cfg.o2cal.V2_mV = V2_mV;
+  _cfg.o2cal.T2_C  = T2_C;
+}
+void ConfigStore::getO2Cal(float& V1_mV, float& T1_C, float& V2_mV, float& T2_C) const {
+  V1_mV = _cfg.o2cal.V1_mV;
+  T1_C  = _cfg.o2cal.T1_C;
+  V2_mV = _cfg.o2cal.V2_mV;
+  T2_C  = _cfg.o2cal.T2_C;
+}
+bool ConfigStore::hasO2Cal() const {
+  const bool v1ok = !(isnan(_cfg.o2cal.V1_mV) || isnan(_cfg.o2cal.T1_C));
+  const bool v2ok = !(isnan(_cfg.o2cal.V2_mV) || isnan(_cfg.o2cal.T2_C));
+  (void)v2ok;
+  return v1ok;
 }
 
 // ---- FILL TIMES ----

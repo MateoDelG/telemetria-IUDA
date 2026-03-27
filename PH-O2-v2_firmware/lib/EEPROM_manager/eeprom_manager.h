@@ -30,6 +30,11 @@ public:
   bool hasPH2pt() const;  // true si V7 y V4 no son NaN
   bool hasPH3pt() const;  // true si V4, V7 y V10 no son NaN
 
+  // --- O2 (2 puntos: V1/T1 y V2/T2) ---
+  void setO2Cal(float V1_mV, float T1_C, float V2_mV, float T2_C);
+  void getO2Cal(float& V1_mV, float& T1_C, float& V2_mV, float& T2_C) const;
+  bool hasO2Cal() const;
+
   // === FILL TIMES (duraciones planificadas) ===
   void     setFillTimes(uint32_t kcl_ms, uint32_t h2o_ms, uint32_t sample_ms);
   void     getFillTimes(uint32_t& kcl_ms, uint32_t& h2o_ms, uint32_t& sample_ms) const;
@@ -65,13 +70,14 @@ public:
   const char* lastError() const { return _err; }
 
   // Versión del layout actual
-  static constexpr uint16_t kVersion = 0x0007;  // v7: añade ph3pt (4,7,10) manteniendo ph2pt
+  static constexpr uint16_t kVersion = 0x0008;  // v8: añade calibración O2 (2pt)
 
 private:
   // ====== Estructuras ======
   struct Pair  { float scale; float offset; };
   struct PH2pt { float V7; float V4; float tC; };
   struct PH3pt { float V4; float V7; float V10; float tC; };
+  struct O2Cal { float V1_mV; float T1_C; float V2_mV; float T2_C; };
 
   // ====== Estructura persistente (v7) ======
   struct ConfigData {
@@ -83,6 +89,9 @@ private:
     // Calibraciones pH
     PH2pt    ph2pt;     // 2 puntos (opcional)
     PH3pt    ph3pt;     // 3 puntos (opcional)
+
+    // Calibración O2 (2 puntos)
+    O2Cal    o2cal;
 
     // Fill/Drain planificados
     uint32_t kcl_fill_ms;

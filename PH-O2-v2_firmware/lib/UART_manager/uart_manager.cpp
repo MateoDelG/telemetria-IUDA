@@ -40,6 +40,7 @@ void UARTManager::setAutoRunning(bool v)           { lock(); auto_running_ = v; 
 void UARTManager::setAutoMeasureRequested(bool v)  { lock(); autoMeasureRequested_ = v;   unlock(); }
 
 void UARTManager::setLastPh(float v)               { lock(); last_ph_ = v;  last_has_data_ = true; unlock(); }
+void UARTManager::setLastO2(float v)               { lock(); last_o2_ = v;  last_has_data_ = true; unlock(); }
 void UARTManager::setLastTempC(float v)            { lock(); last_tempC_ = v; last_has_data_ = true; unlock(); }
 void UARTManager::setLastResult(const String& r)   { lock(); last_result_ = r; last_has_data_ = true; unlock(); }
 void UARTManager::setLastHasData(bool v)           { lock(); last_has_data_ = v; unlock(); }
@@ -63,6 +64,7 @@ bool   UARTManager::getAutoRunning() const         { return auto_running_; }
 bool   UARTManager::getAutoMeasureRequested() const{ return autoMeasureRequested_; }
 
 float  UARTManager::getLastPh() const              { return last_ph_; }
+float  UARTManager::getLastO2() const              { return last_o2_; }
 float  UARTManager::getLastTempC() const           { return last_tempC_; }
 String UARTManager::getLastResult() const          { return last_result_; }
 bool   UARTManager::getLastHasData() const         { return last_has_data_; }
@@ -131,10 +133,9 @@ void UARTManager::addSamplesArray_(JsonObject parent) {
 
 // --- get_status ---
 void UARTManager::handle_get_status_() {
-  bool h2o, kcl, run, areq;
+  bool h2o, run, areq;
   lock();
   h2o  = levelH2O_ok_;
-  kcl  = levelKCL_ok_;
   run  = auto_running_;
   areq = autoMeasureRequested_;
   unlock();
@@ -145,7 +146,6 @@ void UARTManager::handle_get_status_() {
 
   JsonObject js = data.createNestedObject("level_sensors");
   js["h2o"] = h2o;
-  js["kcl"] = kcl;
 
   data["auto_running"] = run;
   data["auto_req"]     = areq;
@@ -156,7 +156,6 @@ void UARTManager::handle_get_status_() {
   sendJson_(out);
 
   remoteManager.log(String("[UART] TX get_status -> h2o=") + (h2o?"1":"0") +
-                    " kcl=" + (kcl?"1":"0") +
                     " auto_running=" + (run?"1":"0") +
                     " auto_req=" + (areq?"1":"0"));
 }
@@ -166,7 +165,7 @@ void UARTManager::handle_get_last_() {
   bool has;
   float ph, tc;
   String res;
-  bool h2o, kcl;
+  bool h2o;
 
   lock();
   has = last_has_data_;
@@ -174,7 +173,6 @@ void UARTManager::handle_get_last_() {
   tc  = last_tempC_;
   res = last_result_;
   h2o = levelH2O_ok_;
-  kcl = levelKCL_ok_;
   unlock();
 
   if (!has) {
@@ -191,7 +189,6 @@ void UARTManager::handle_get_last_() {
 
   JsonObject js = data.createNestedObject("level_sensors");
   js["h2o"] = h2o;
-  js["kcl"] = kcl;
 
   // [{id, ph_val, o2_val} x4]
   addSamplesArray_(data);
@@ -202,7 +199,6 @@ void UARTManager::handle_get_last_() {
   remoteManager.log(String("[UART] TX get_last -> ph=") + ph +
                     " tempC=" + tc +
                     " h2o=" + (h2o?"1":"0") +
-                    " kcl=" + (kcl?"1":"0") +
                     " result=" + res);
 }
 

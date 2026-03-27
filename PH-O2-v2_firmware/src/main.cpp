@@ -2,6 +2,7 @@
 #include "eeprom_manager.h"
 #include "menu_manager.h"
 #include "pH_manager.h"
+#include "o2_manager.h"
 #include "pumps_manager.h"
 #include "level_sensors_manager.h"
 #include "test_board.h"
@@ -22,6 +23,7 @@ UartProto::UARTManager uart2(Serial2);
 
 PumpsManager pumps;
 PHManager ph(&ads, /*channel=*/0, /*avgSamples=*/6);
+O2Manager o2(&ads, /*channel=*/1, /*avgSamples=*/6);
 ConfigStore eeprom;
 LevelSensorsManager levels; 
 WebPortalManager webPortal(&pumps, &levels, &uart2, &eeprom);
@@ -37,11 +39,13 @@ void initThermo();
 void initLCD();
 void initADC();
 void initPH();
+void initO2();
 void initEEPROM();
 void initPumps();
 float readThermo();
 float readADC();
 float readPH();
+float readO2();
 static void webLogHook(const String& message);
 static bool handleWebAction(const String& action, const String& value, String& outMessage);
 
@@ -63,6 +67,7 @@ void setup() {
   initLCD();
   initADC();
   initPH();
+  initO2();
   startProcess = true;
 }
 
@@ -344,6 +349,44 @@ float readPH() {
   return phValue;
 }
 
+float readO2() {
+  extern float readThermo();
+
+  float tC = readThermo();
+  bool tOk = isfinite(tC) && tC > -40.0f && tC < 125.0f;
+  if (!tOk) tC = 25.0f;
+
+  float do_mgL = NAN, volts = NAN;
+  if (!o2.readDO(tC, do_mgL, &volts)) {
+    remoteManager.log(String("O2 ERR: ") + o2.lastError());
+    return NAN;
+  }
+
+  uart2.setLastO2(do_mgL);
+
+  remoteManager.log(
+    "O2 = " + String(do_mgL, 3) +
+    " mg/L  V=" + String(volts, 4) +
+    "  T=" + String(tC, 1) + "°C"
+  );
+
+  return do_mgL;
+}
+
+void initO2() {
+  o2.begin();
+
+  if (o2.applyEEPROMCalibration(eeprom)) {
+    float V1, T1, V2, T2;
+    o2.getTwoPointCalibration(V1, T1, V2, T2);
+    remoteManager.log(String("O2 cal cargada: V1=") + String(V1, 1) +
+                      "mV T1=" + String(T1, 1) + "C V2=" +
+                      String(V2, 1) + "mV T2=" + String(T2, 1) + "C");
+  } else {
+    remoteManager.log(String("O2 cal: ") + o2.lastError());
+  }
+}
+
 static void webLogHook(const String& message) {
   webPortal.log(message);
 }
@@ -363,6 +406,11 @@ static bool handleWebAction(const String& action, const String& value, String& o
   if (action == "read_ph") {
     float v = readPH();
     outMessage = String("ph=") + String(v, 2);
+    return true;
+  }
+  if (action == "read_o2") {
+    float v = readO2();
+    outMessage = String("o2=") + String(v, 3);
     return true;
   }
   if (action == "read_temp") {
@@ -403,13 +451,13 @@ static bool handleWebAction(const String& action, const String& value, String& o
     }
 
     auto readU = [&](const char* key, uint32_t def) -> uint32_t {
-      if (!doc.containsKey(key)) return def;
+      if (!doc[key].is<long>()) return def;
       long v = doc[key].as<long>();
       if (v < 0) v = 0;
       return (uint32_t)v;
     };
     auto readSampleCount = [&](const char* key, uint8_t def) -> uint8_t {
-      if (!doc.containsKey(key)) return def;
+      if (!doc[key].is<long>()) return def;
       long v = doc[key].as<long>();
       if (v < 0) v = 0;
       if (v > 4) v = 4;
@@ -1563,6 +1611,7 @@ static bool AutoModeTick() {
   extern ConfigStore            eeprom;
   extern LevelSensorsManager    levels;     // O2/PH/H2O (pull-up externas, activo=HIGH)
   extern float                  readPH();
+  extern float                  readO2();
   extern float                  readThermo();
   extern UartProto::UARTManager uart2;      // para registrar pH por sample
 
@@ -1722,12 +1771,12 @@ static bool AutoModeTick() {
     return true;
   }
 
-  // ---------- Precondición: H2O debe estar en HIGH ----------
+  // ---------- Precondición: H2O y pH deben estar en HIGH ----------
   if (!started) {
     const bool h2oHigh = levels.h2o();
     const bool phHigh  = levels.ph();
     const bool o2High  = levels.o2();
-    if (!h2oHigh) {
+    if (!h2oHigh || !phHigh) {
       const char* sH2O = h2oHigh ? "HI " : "LO ";
       const char* sPH  = phHigh  ? "HI " : "LO ";
       const char* sO2  = o2High  ? "HI " : "LO ";
@@ -1914,16 +1963,33 @@ static bool AutoModeTick() {
         uart2.setLastPh(phv);
         uart2.setSamplePhValueById(sampleId, phv);
 
-        snprintf(L0, sizeof(L0), "pH: %.02f", phv);
+        readO2();
+
+        snprintf(L0, sizeof(L0), "pH: %.02f pH", phv);
         snprintf(L1, sizeof(L1), "OK");
         show(L0, L1);
 
         tPost = millis();
         phase = Phase::POST;
       } else if (phase == Phase::POST) {
-        if (millis() - tPost >= MSG_MS) phase = Phase::EXIT;
+        if (millis() - tPost >= MSG_MS) {
+          char L0[17], L1[17];
+          snprintf(L0, sizeof(L0), "Leyendo O2");
+          snprintf(L1, sizeof(L1), " ");
+          show(L0, L1);
+
+          float o2v = readO2();
+          snprintf(L0, sizeof(L0), "O2: %.03f mg/L", o2v);
+          snprintf(L1, sizeof(L1), "OK");
+          show(L0, L1);
+
+          tPost = millis();
+          phase = Phase::EXIT;
+        }
       } else if (phase == Phase::EXIT) {
-        idx++; phase = Phase::ENTER;
+        if (millis() - tPost >= MSG_MS) {
+          idx++; phase = Phase::ENTER;
+        }
       }
     } break;
 
@@ -1965,14 +2031,309 @@ static bool AutoModeTick() {
   return false;
 }
 
+static bool runO2Calibration_1P(uint8_t samples = 31) {
+  extern O2Manager              o2;
+  extern ADS1115Manager         ads;
+  extern float                  readThermo();
+  extern ConfigStore            eeprom;
+
+  enum class Step : uint8_t {
+    START,
+    WAIT,
+    CAPT,
+    APPLY,
+    DONE,
+    CANCEL
+  };
+  static Step step = Step::START;
+
+  static float V1_mV = NAN;
+  static float T1_C = NAN;
+
+  auto title = []() { lcd.printAt(0, 0, "Calibrar O2"); };
+  auto ask = [&]() { title(); lcd.printAt(0, 1, "Punto  OK"); };
+  auto busy = [&](const char* m) { title(); lcd.printAt(0, 1, m); };
+  auto showErr = [](const char* a, const char* b = "") { lcd.splash(a, b, 900); };
+
+  auto insertionSort = [](float* arr, uint16_t n){
+    for (uint16_t i = 1; i < n; ++i) {
+      float key = arr[i];
+      int j = (int)i - 1;
+      while (j >= 0 && arr[j] > key) {
+        arr[j+1] = arr[j];
+        --j;
+      }
+      arr[j+1] = key;
+    }
+  };
+
+  auto medianVoltADS = [&](uint16_t N) -> float {
+    static constexpr uint16_t MAX_S = 128;
+    if (N == 0) N = 1;
+    if (N > MAX_S) N = MAX_S;
+
+    float buf[MAX_S];
+    uint16_t k = 0;
+
+    for (uint16_t i = 0; i < N; ++i) {
+      float v = NAN;
+      if (ads.readSingle(1, v) && isfinite(v)) {
+        buf[k++] = v;
+      }
+      delay(4);
+    }
+
+    if (k < 3) return NAN;
+
+    insertionSort(buf, k);
+    if (k & 1) {
+      return buf[k/2];
+    }
+    uint16_t r = k/2;
+    return 0.5f * (buf[r-1] + buf[r]);
+  };
+
+  switch (step) {
+    case Step::START: {
+      ads.setAveraging(samples);
+      lcd.clear();
+      ask();
+      step = Step::WAIT;
+      return false;
+    }
+
+    case Step::WAIT: {
+      if (Buttons::BTN_ESC.value) { Buttons::BTN_ESC.reset(); step = Step::CANCEL; return false; }
+      if (Buttons::BTN_OK.value)  { Buttons::BTN_OK.reset();  step = Step::CAPT; return false; }
+      return false;
+    }
+
+    case Step::CAPT: {
+      busy("Calibrando...");
+      float v = medianVoltADS(samples);
+      float tC = readThermo();
+      bool tOk = isfinite(tC) && tC > -40.0f && tC < 125.0f;
+      if (!tOk) tC = 25.0f;
+
+      if (!isfinite(v)) {
+        showErr("O2 cal", "Voltaje invalido");
+        step = Step::DONE;
+        return false;
+      }
+
+      V1_mV = v * 1000.0f;
+      T1_C = tC;
+      lcd.splash("Punto OK", "", 700);
+      step = Step::APPLY;
+      return false;
+    }
+
+    case Step::APPLY: {
+      o2.setSinglePointCalibration(V1_mV, T1_C);
+      eeprom.setO2Cal(V1_mV, T1_C, NAN, NAN);
+      if (!eeprom.save()) {
+        remoteManager.log(String("EEPROM save fallo: ") + eeprom.lastError());
+        showErr("EEPROM", "Save fallo");
+        step = Step::DONE;
+        return false;
+      }
+
+      remoteManager.log(String("O2 cal 1p aplicada: V=") + String(V1_mV, 1) +
+                        "mV T=" + String(T1_C, 1) + "C");
+      char l2[17];
+      snprintf(l2, sizeof(l2), "V=%.0f T=%.1f", V1_mV, T1_C);
+      lcd.splash("O2 calibrado", l2, 800);
+
+      step = Step::DONE;
+      return false;
+    }
+
+    case Step::CANCEL:
+      remoteManager.log("O2 cal 1p: CANCEL");
+      showErr("Calibracion", "Cancelada");
+      step = Step::DONE;
+      return false;
+
+    case Step::DONE:
+    default:
+      step = Step::START;
+      return true;
+  }
+  return false;
+}
+
+static bool runO2Calibration_2P(uint8_t samples = 31) {
+  extern O2Manager              o2;
+  extern ADS1115Manager         ads;
+  extern float                  readThermo();
+  extern ConfigStore            eeprom;
+
+  enum class Step : uint8_t {
+    START,
+    WAIT_HIGH,
+    CAPT_HIGH,
+    WAIT_LOW,
+    CAPT_LOW,
+    APPLY,
+    DONE,
+    CANCEL
+  };
+  static Step step = Step::START;
+
+  static float V1_mV = NAN, V2_mV = NAN;
+  static float T1_C = NAN, T2_C = NAN;
+
+  auto title = []() { lcd.printAt(0, 0, "Calibrar O2"); };
+  auto askHigh = [&]() { title(); lcd.printAt(0, 1, "Alta T   OK"); };
+  auto askLow = [&]() { title(); lcd.printAt(0, 1, "Baja T   OK"); };
+  auto busy = [&](const char* m) { title(); lcd.printAt(0, 1, m); };
+  auto showErr = [](const char* a, const char* b = "") { lcd.splash(a, b, 900); };
+
+  auto insertionSort = [](float* arr, uint16_t n){
+    for (uint16_t i = 1; i < n; ++i) {
+      float key = arr[i];
+      int j = (int)i - 1;
+      while (j >= 0 && arr[j] > key) {
+        arr[j+1] = arr[j];
+        --j;
+      }
+      arr[j+1] = key;
+    }
+  };
+
+  auto medianVoltADS = [&](uint16_t N) -> float {
+    static constexpr uint16_t MAX_S = 128;
+    if (N == 0) N = 1;
+    if (N > MAX_S) N = MAX_S;
+
+    float buf[MAX_S];
+    uint16_t k = 0;
+
+    for (uint16_t i = 0; i < N; ++i) {
+      float v = NAN;
+      if (ads.readSingle(1, v) && isfinite(v)) {
+        buf[k++] = v;
+      }
+      delay(4);
+    }
+
+    if (k < 3) return NAN;
+
+    insertionSort(buf, k);
+    if (k & 1) {
+      return buf[k/2];
+    }
+    uint16_t r = k/2;
+    return 0.5f * (buf[r-1] + buf[r]);
+  };
+
+  switch (step) {
+    case Step::START: {
+      ads.setAveraging(samples);
+      lcd.clear();
+      askHigh();
+      step = Step::WAIT_HIGH;
+      return false;
+    }
+
+    case Step::WAIT_HIGH: {
+      if (Buttons::BTN_ESC.value) { Buttons::BTN_ESC.reset(); step = Step::CANCEL; return false; }
+      if (Buttons::BTN_OK.value)  { Buttons::BTN_OK.reset();  step = Step::CAPT_HIGH; return false; }
+      return false;
+    }
+
+    case Step::CAPT_HIGH: {
+      busy("Calibrando...");
+      float v = medianVoltADS(samples);
+      float tC = readThermo();
+      bool tOk = isfinite(tC) && tC > -40.0f && tC < 125.0f;
+      if (!tOk) tC = 25.0f;
+
+      if (!isfinite(v)) {
+        showErr("O2 cal", "Voltaje invalido");
+        step = Step::DONE;
+        return false;
+      }
+
+      V1_mV = v * 1000.0f;
+      T1_C = tC;
+      lcd.splash("Punto Alta OK", "", 700);
+      step = Step::WAIT_LOW;
+      return false;
+    }
+
+    case Step::WAIT_LOW: {
+      askLow();
+      if (Buttons::BTN_ESC.value) { Buttons::BTN_ESC.reset(); step = Step::CANCEL; return false; }
+      if (Buttons::BTN_OK.value)  { Buttons::BTN_OK.reset();  step = Step::CAPT_LOW; return false; }
+      return false;
+    }
+
+    case Step::CAPT_LOW: {
+      busy("Calibrando...");
+      float v = medianVoltADS(samples);
+      float tC = readThermo();
+      bool tOk = isfinite(tC) && tC > -40.0f && tC < 125.0f;
+      if (!tOk) tC = 25.0f;
+
+      if (!isfinite(v)) {
+        showErr("O2 cal", "Voltaje invalido");
+        step = Step::DONE;
+        return false;
+      }
+
+      V2_mV = v * 1000.0f;
+      T2_C = tC;
+      lcd.splash("Punto Baja OK", "", 700);
+      step = Step::APPLY;
+      return false;
+    }
+
+    case Step::APPLY: {
+      o2.setTwoPointCalibration(V1_mV, T1_C, V2_mV, T2_C);
+      eeprom.setO2Cal(V1_mV, T1_C, V2_mV, T2_C);
+      if (!eeprom.save()) {
+        remoteManager.log(String("EEPROM save fallo: ") + eeprom.lastError());
+        showErr("EEPROM", "Save fallo");
+        step = Step::DONE;
+        return false;
+      }
+
+      remoteManager.log(String("O2 cal aplicada: V1=") + String(V1_mV, 1) +
+                        "mV T1=" + String(T1_C, 1) + "C V2=" +
+                        String(V2_mV, 1) + "mV T2=" + String(T2_C, 1) + "C");
+      char l2[17];
+      snprintf(l2, sizeof(l2), "V1=%.0f V2=%.0f", V1_mV, V2_mV);
+      lcd.splash("O2 calibrado", l2, 800);
+
+      step = Step::DONE;
+      return false;
+    }
+
+    case Step::CANCEL:
+      remoteManager.log("O2 cal: CANCEL");
+      showErr("Calibracion", "Cancelada");
+      step = Step::DONE;
+      return false;
+
+    case Step::DONE:
+    default:
+      step = Step::START;
+      return true;
+  }
+}
+
 static void MenuDemoTick() {
   // --- prototipos externos que usa el menú ---
   extern ConfigStore eeprom;
   extern bool  runADSCalibration_0V_3p31V(uint8_t, uint8_t);
   extern bool  runPHCalibration_7_4(uint8_t samples);
   extern bool  runPHCalibration_4_7_10(uint16_t samples, bool piecewise);
+  extern bool  runO2Calibration_1P(uint8_t samples);
+  extern bool  runO2Calibration_2P(uint8_t samples);
   extern float readADC();
   extern float readPH();
+  extern float readO2();
   extern float readThermo();
   extern bool  AutoModeTick();
   extern UartProto::UARTManager uart2;
@@ -2001,6 +2362,10 @@ static void MenuDemoTick() {
     CAL_PH_READ,        // <-- conservado
     CAL_PH_RUN_2P,      // <-- calibración 2 puntos
     CAL_PH_RUN_3P_PW,   // <-- calibración 3 puntos (piecewise)
+    CAL_O2_MENU,
+    CAL_O2_READ,
+    CAL_O2_RUN_1P,
+    CAL_O2_RUN_2P,
     CFG_TIMEOUTS,
     CFG_FILL
   };
@@ -2034,6 +2399,15 @@ static void MenuDemoTick() {
   };
   static uint8_t phCursor = 0;
   const uint8_t PH_N = sizeof(phItems) / sizeof(phItems[0]);
+
+  // ---- Submenú O2: leer + calibración 2 puntos ----
+  static const char *o2Items[] = {
+    "Leer O2",
+    "Cal O2 (1p)",
+    "Cal O2 (2p)"
+  };
+  static uint8_t o2Cursor = 0;
+  const uint8_t O2_N = sizeof(o2Items) / sizeof(o2Items[0]);
 
   // ---- Temperatura ----
   static int8_t tempOffset = 0;
@@ -2072,6 +2446,10 @@ static void MenuDemoTick() {
     lcd.printAt(0, 0, "Calibrar pH");
     lcd.printAt(0, 1, ">" + String(phItems[phCursor]));
   };
+  auto renderO2Menu = [&]() {
+    lcd.printAt(0, 0, "Calibrar O2");
+    lcd.printAt(0, 1, ">" + String(o2Items[o2Cursor]));
+  };
   auto renderADSRead = [&]() {
     float v = readADC();
     float m, b; eeprom.getADC(m, b);
@@ -2083,6 +2461,14 @@ static void MenuDemoTick() {
   auto renderPHRead = [&]() {
     float phv = readPH();
     char l0[17]; snprintf(l0, sizeof(l0), "pH: %.02f", phv);
+    lcd.printAt(0, 0, l0);
+    lcd.printAt(0, 1, "OK refrescar");
+  };
+  auto renderO2Read = [&]() {
+    lcd.printAt(0, 0, "Leyendo");
+    lcd.printAt(0, 1, " ");
+    float o2v = readO2();
+    char l0[17]; snprintf(l0, sizeof(l0), "O2: %.03f", o2v);
     lcd.printAt(0, 0, l0);
     lcd.printAt(0, 1, "OK refrescar");
   };
@@ -2198,7 +2584,7 @@ static void MenuDemoTick() {
       case Btn::OK:
         lcd.clear();
         if (cfgCursor == 0) view = View::CAL_PH_MENU, renderPHMenu();
-        else if (cfgCursor == 1) lcd.splash("Calibrar O2", "Pendiente", 700), renderConfig();
+        else if (cfgCursor == 1) view = View::CAL_O2_MENU, renderO2Menu();
         else if (cfgCursor == 2) view = View::TEMP, renderTemp();
         else if (cfgCursor == 3) view = View::CAL_ADS_MENU, renderADSMenu();
         else if (cfgCursor == 4) view = View::CFG_TIMEOUTS;
@@ -2247,6 +2633,46 @@ static void MenuDemoTick() {
   case View::CAL_PH_RUN_3P_PW:
     if (runPHCalibration_4_7_10(31, false)) {
       view = View::CAL_PH_MENU; lcd.clear(); renderPHMenu();
+    }
+    break;
+
+  // ---------- CALIBRACION O2 ----------
+  case View::CAL_O2_MENU: {
+    switch (readLatched()) {
+      case Btn::UP:
+        o2Cursor = (o2Cursor == 0) ? (O2_N - 1) : o2Cursor - 1;
+        lcd.clear(); renderO2Menu(); break;
+      case Btn::DOWN:
+        o2Cursor = (o2Cursor + 1) % O2_N;
+        lcd.clear(); renderO2Menu(); break;
+      case Btn::OK:
+        if (o2Cursor == 0) view = View::CAL_O2_READ, lcd.clear(), renderO2Read();
+        else if (o2Cursor == 1) view = View::CAL_O2_RUN_1P, lcd.clear();
+        else view = View::CAL_O2_RUN_2P, lcd.clear();
+        break;
+      case Btn::ESC:
+        view = View::CONFIG; lcd.clear(); renderConfig(); break;
+      default: break;
+    }
+  } break;
+
+  case View::CAL_O2_READ: {
+    switch (readLatched()) {
+      case Btn::OK: lcd.clear(); renderO2Read(); break;
+      case Btn::ESC: view = View::CAL_O2_MENU; lcd.clear(); renderO2Menu(); break;
+      default: break;
+    }
+  } break;
+
+  case View::CAL_O2_RUN_1P:
+    if (runO2Calibration_1P(31)) {
+      view = View::CAL_O2_MENU; lcd.clear(); renderO2Menu();
+    }
+    break;
+
+  case View::CAL_O2_RUN_2P:
+    if (runO2Calibration_2P(31)) {
+      view = View::CAL_O2_MENU; lcd.clear(); renderO2Menu();
     }
     break;
 

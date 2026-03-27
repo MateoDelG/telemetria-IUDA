@@ -135,9 +135,18 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <main>
     <div class="grid">
       <div class="card">
+        <h3>Temp</h3>
+        <div class="value" id="tempValue">--</div>
+        <div class="row"><span class="muted">Unidades</span><span>C</span></div>
+      </div>
+      <div class="card">
         <h3>pH</h3>
         <div class="value" id="phValue">--</div>
-        <div class="row"><span class="muted">Temp</span><span id="tempValue">--</span></div>
+      </div>
+      <div class="card">
+        <h3>O2</h3>
+        <div class="value" id="o2Value">--</div>
+        <div class="row"><span class="muted">Unidades</span><span>mg/L</span></div>
       </div>
       <div class="card">
         <h3>Modo</h3>
@@ -160,6 +169,13 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         <div class="row"><span><span class="led" id="lvlKCL"></span>KCL</span><span id="lvlKCLText">--</span></div>
       </div>
       <div class="card">
+        <h3>Calibracion</h3>
+        <div class="row"><span>pH</span><span id="calPhMethod">--</span></div>
+        <div class="row"><span class="muted" id="calPhVals">--</span></div>
+        <div class="row"><span>O2</span><span id="calO2Method">--</span></div>
+        <div class="row"><span class="muted" id="calO2Vals">--</span></div>
+      </div>
+      <div class="card">
         <h3>Bombas</h3>
         <div class="row"><span><span class="led" id="pKCL"></span>KCL</span><span id="pKCLText">--</span></div>
         <div class="row"><span><span class="led" id="pH2O"></span>H2O</span><span id="pH2OText">--</span></div>
@@ -172,6 +188,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
           <button class="primary" onclick="doAction('auto_start')">Auto start</button>
           <button class="warn" onclick="doAction('auto_cancel')">Auto cancel</button>
           <button onclick="doAction('read_ph')">Leer pH</button>
+          <button onclick="doAction('read_o2')">Leer O2</button>
           <button onclick="doAction('read_temp')">Leer temp</button>
           <button class="bad" onclick="doAction('clear_logs')">Limpiar consola</button>
         </div>
@@ -219,6 +236,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         const data = await res.json();
 
         document.getElementById('phValue').textContent = Number.isFinite(data.ph) ? data.ph.toFixed(3) : '--';
+        document.getElementById('o2Value').textContent = Number.isFinite(data.o2) ? (data.o2.toFixed(3) + ' mg/L') : '--';
         document.getElementById('tempValue').textContent = Number.isFinite(data.temp_c) ? (data.temp_c.toFixed(1) + ' C') : '--';
         document.getElementById('autoState').textContent = data.auto_running ? 'AUTO' : 'MANUAL';
         document.getElementById('lastResult').textContent = data.last_result || '--';
@@ -230,6 +248,27 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         setLevel('lvlPH', 'lvlPHText', data.levels?.ph);
         setLevel('lvlH2O', 'lvlH2OText', data.levels?.h2o);
         setLevel('lvlKCL', 'lvlKCLText', data.levels?.kcl);
+
+        const phMethod = data.cal?.ph?.method || '--';
+        const o2Method = data.cal?.o2?.method || '--';
+        document.getElementById('calPhMethod').textContent = phMethod;
+        document.getElementById('calO2Method').textContent = o2Method;
+
+        let phVals = '--';
+        if (phMethod === '3p') {
+          phVals = `V4=${data.cal?.ph?.v4?.toFixed(3)} V7=${data.cal?.ph?.v7?.toFixed(3)} V10=${data.cal?.ph?.v10?.toFixed(3)} T=${data.cal?.ph?.tcal?.toFixed(1)}`;
+        } else if (phMethod === '2p') {
+          phVals = `V7=${data.cal?.ph?.v7?.toFixed(3)} V4=${data.cal?.ph?.v4?.toFixed(3)} T=${data.cal?.ph?.tcal?.toFixed(1)}`;
+        }
+        document.getElementById('calPhVals').textContent = phVals;
+
+        let o2Vals = '--';
+        if (o2Method === '2p') {
+          o2Vals = `V1=${data.cal?.o2?.v1?.toFixed(1)} T1=${data.cal?.o2?.t1?.toFixed(1)} V2=${data.cal?.o2?.v2?.toFixed(1)} T2=${data.cal?.o2?.t2?.toFixed(1)}`;
+        } else if (o2Method === '1p') {
+          o2Vals = `V=${data.cal?.o2?.v1?.toFixed(1)} T=${data.cal?.o2?.t1?.toFixed(1)}`;
+        }
+        document.getElementById('calO2Vals').textContent = o2Vals;
 
         setLevel('pKCL', 'pKCLText', data.pumps?.kcl);
         setLevel('pH2O', 'pH2OText', data.pumps?.h2o);
@@ -397,12 +436,14 @@ void WebPortalManager::handleStatus_() {
   JsonDocument doc;
 
   float lastPh = NAN;
+  float lastO2 = NAN;
   float lastTemp = NAN;
   bool autoRun = false;
   String lastResult;
 
   if (uart_) {
     lastPh = uart_->getLastPh();
+    lastO2 = uart_->getLastO2();
     lastTemp = uart_->getLastTempC();
     autoRun = uart_->getAutoRunning();
     lastResult = uart_->getLastResult();
@@ -412,6 +453,11 @@ void WebPortalManager::handleStatus_() {
     doc["ph"] = lastPh;
   } else {
     doc["ph"] = nullptr;
+  }
+  if (isfinite(lastO2)) {
+    doc["o2"] = lastO2;
+  } else {
+    doc["o2"] = nullptr;
   }
   if (isfinite(lastTemp)) {
     doc["temp_c"] = lastTemp;
@@ -464,6 +510,49 @@ void WebPortalManager::handleStatus_() {
   }
 
   if (eeprom_) {
+    JsonObject cal = doc["cal"].to<JsonObject>();
+    JsonObject calPh = cal["ph"].to<JsonObject>();
+    JsonObject calO2 = cal["o2"].to<JsonObject>();
+
+    float V4 = NAN, V7 = NAN, V10 = NAN, Tcal = NAN;
+    if (eeprom_->hasPH3pt()) {
+      eeprom_->getPH3pt(V4, V7, V10, Tcal);
+      calPh["method"] = "3p";
+      calPh["v4"] = V4;
+      calPh["v7"] = V7;
+      calPh["v10"] = V10;
+      calPh["tcal"] = Tcal;
+    } else if (eeprom_->hasPH2pt()) {
+      eeprom_->getPH2pt(V7, V4, Tcal);
+      calPh["method"] = "2p";
+      calPh["v4"] = V4;
+      calPh["v7"] = V7;
+      calPh["tcal"] = Tcal;
+      calPh["v10"] = nullptr;
+    } else {
+      calPh["method"] = "NoCal";
+    }
+
+    float V1 = NAN, T1 = NAN, V2 = NAN, T2 = NAN;
+    eeprom_->getO2Cal(V1, T1, V2, T2);
+    const bool v1ok = isfinite(V1) && isfinite(T1);
+    const bool v2ok = isfinite(V2) && isfinite(T2);
+    if (v1ok && v2ok) {
+      calO2["method"] = "2p";
+      calO2["v1"] = V1;
+      calO2["t1"] = T1;
+      calO2["v2"] = V2;
+      calO2["t2"] = T2;
+    } else if (v1ok) {
+      calO2["method"] = "1p";
+      calO2["v1"] = V1;
+      calO2["t1"] = T1;
+      calO2["v2"] = nullptr;
+      calO2["t2"] = nullptr;
+    } else {
+      calO2["method"] = "NoCal";
+    }
+
     JsonObject times = doc["times"].to<JsonObject>();
     times["kcl_fill_s"] = (uint32_t)(eeprom_->kclFillMs() / 1000UL);
     times["h2o_fill_s"] = (uint32_t)(eeprom_->h2oFillMs() / 1000UL);
