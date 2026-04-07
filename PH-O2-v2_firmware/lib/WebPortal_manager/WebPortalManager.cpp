@@ -1,4 +1,5 @@
 #include "WebPortalManager.h"
+#include "services/console/console_service.h"
 
 #include <WiFi.h>
 
@@ -112,6 +113,26 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     button.primary { border-color: var(--accent); }
     button.warn { border-color: var(--warn); }
     button.bad { border-color: var(--bad); }
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    input {
+      background: #0b1020;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 8px;
+      font-size: 13px;
+    }
+    input:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(34,211,238,0.15);
+    }
     .console {
       background: #0b1020;
       border: 1px solid var(--border);
@@ -207,14 +228,14 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
     <div class="card">
       <h3>Tiempos</h3>
-      <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));">
-        <label>KCL fill (s)<br><input id="t-kcl" type="number" min="0" step="1"></label>
+      <div class="grid">
         <label>H2O fill (s)<br><input id="t-h2o" type="number" min="0" step="1"></label>
         <label>Sample fill (s)<br><input id="t-sample" type="number" min="0" step="1"></label>
         <label>Drain (s)<br><input id="t-drain" type="number" min="0" step="1"></label>
         <label>Sample timeout (s)<br><input id="t-sample-timeout" type="number" min="0" step="1"></label>
         <label>Drain timeout (s)<br><input id="t-drain-timeout" type="number" min="0" step="1"></label>
-        <label>Estabilizacion (s)<br><input id="t-stab" type="number" min="0" step="1"></label>
+        <label>O2 stabilization (s)<br><input id="t-stab-o2" type="number" min="0" step="1"></label>
+        <label>pH stabilization (s)<br><input id="t-stab-ph" type="number" min="0" step="1"></label>
         <label>Samples (0-4)<br><input id="t-sample-count" type="number" min="0" max="4" step="1"></label>
       </div>
       <div class="btns" style="margin-top:10px;">
@@ -288,17 +309,6 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       }
     }
 
-    async function fetchLogs() {
-      try {
-        const res = await fetch('/api/logs');
-        const data = await res.json();
-        const lines = data.lines || [];
-        document.getElementById('consoleBox').textContent = lines.join('\n');
-      } catch (e) {
-        console.log('logs err', e);
-      }
-    }
-
     async function doAction(action, value) {
       try {
         const body = value ? ('action=' + encodeURIComponent(action) + '&value=' + encodeURIComponent(value))
@@ -310,7 +320,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         });
         await res.json();
         fetchStatus();
-        fetchLogs();
+        if (action === 'clear_logs') {
+          const box = document.getElementById('consoleBox');
+          if (box) box.textContent = '';
+        }
       } catch (e) {
         console.log('action err', e);
       }
@@ -332,13 +345,16 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         const res = await fetch('/api/status');
         const data = await res.json();
         if (data.times) {
-          setInput('t-kcl', data.times.kcl_fill_s);
           setInput('t-h2o', data.times.h2o_fill_s);
           setInput('t-sample', data.times.sample_fill_s);
           setInput('t-drain', data.times.drain_s);
           setInput('t-sample-timeout', data.times.sample_timeout_s);
           setInput('t-drain-timeout', data.times.drain_timeout_s);
-          setInput('t-stab', data.times.stabilization_s);
+          const o2Stab = (data.times.o2_stabilization_s !== undefined && data.times.o2_stabilization_s !== null)
+                         ? data.times.o2_stabilization_s
+                         : data.times.stabilization_s;
+          setInput('t-stab-o2', o2Stab);
+          setInput('t-stab-ph', data.times.ph_stabilization_s);
           setInput('t-sample-count', data.times.sample_count);
         }
       } catch (e) {
@@ -348,13 +364,13 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
     function saveTimes() {
       const payload = {
-        kcl_fill_s: Number(document.getElementById('t-kcl').value || 0),
         h2o_fill_s: Number(document.getElementById('t-h2o').value || 0),
         sample_fill_s: Number(document.getElementById('t-sample').value || 0),
         drain_s: Number(document.getElementById('t-drain').value || 0),
         sample_timeout_s: Number(document.getElementById('t-sample-timeout').value || 0),
         drain_timeout_s: Number(document.getElementById('t-drain-timeout').value || 0),
-        stabilization_s: Number(document.getElementById('t-stab').value || 0),
+        o2_stabilization_s: Number(document.getElementById('t-stab-o2').value || 0),
+        ph_stabilization_s: Number(document.getElementById('t-stab-ph').value || 0),
         sample_count: Number(document.getElementById('t-sample-count').value || 0)
       };
       doAction('set_times', JSON.stringify(payload));
@@ -378,10 +394,28 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       }
     }
 
+    function appendConsoleLine(line) {
+      const box = document.getElementById('consoleBox');
+      if (!box) return;
+      if (box.textContent === '--') box.textContent = '';
+      if (box.textContent.length > 0) {
+        box.textContent += '\n';
+      }
+      box.textContent += line;
+      box.scrollTop = box.scrollHeight;
+    }
+
+    function startConsoleWs() {
+      const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
+      const ws = new WebSocket(`${proto}://${location.hostname}:81/`);
+      ws.onmessage = (evt) => appendConsoleLine(evt.data);
+      ws.onclose = () => setTimeout(startConsoleWs, 1000);
+      ws.onerror = () => ws.close();
+    }
+
     fetchStatus();
-    fetchLogs();
+    startConsoleWs();
     setInterval(fetchStatus, 1500);
-    setInterval(fetchLogs, 2000);
   </script>
 </body>
 </html>
@@ -398,7 +432,6 @@ bool WebPortalManager::begin() {
 
   server_.on("/", HTTP_GET, [this]() { handleIndex_(); });
   server_.on("/api/status", HTTP_GET, [this]() { handleStatus_(); });
-  server_.on("/api/logs", HTTP_GET, [this]() { handleLogs_(); });
   server_.on("/api/action", HTTP_GET, [this]() { handleAction_(); });
   server_.on("/api/action", HTTP_POST, [this]() { handleAction_(); });
   server_.onNotFound([this]() {
@@ -420,12 +453,12 @@ void WebPortalManager::setActionHandler(ActionHandler handler) {
 }
 
 void WebPortalManager::log(const String& line) {
-  addLogLine_(line);
+  ConsoleService::logSink(line);
 }
 
 void WebPortalManager::clearLogs() {
-  logHead_ = 0;
-  logCount_ = 0;
+  ConsoleService* console = ConsoleService::instance();
+  if (console) console->clear();
 }
 
 void WebPortalManager::handleIndex_() {
@@ -560,20 +593,9 @@ void WebPortalManager::handleStatus_() {
     times["drain_s"] = (uint32_t)(eeprom_->drainMs() / 1000UL);
     times["sample_timeout_s"] = (uint32_t)(eeprom_->sampleTimeoutMs() / 1000UL);
     times["drain_timeout_s"] = (uint32_t)(eeprom_->drainTimeoutMs() / 1000UL);
-    times["stabilization_s"] = (uint32_t)(eeprom_->stabilizationMs() / 1000UL);
+    times["o2_stabilization_s"] = (uint32_t)(eeprom_->o2StabilizationMs() / 1000UL);
+    times["ph_stabilization_s"] = (uint32_t)(eeprom_->phStabilizationMs() / 1000UL);
     times["sample_count"] = (uint32_t)eeprom_->sampleCount();
-  }
-
-  sendJson_(doc);
-}
-
-void WebPortalManager::handleLogs_() {
-  JsonDocument doc;
-  JsonArray arr = doc["lines"].to<JsonArray>();
-
-  for (size_t i = 0; i < logCount_; ++i) {
-    size_t idx = (logHead_ + kLogLines - logCount_ + i) % kLogLines;
-    arr.add(logs_[idx]);
   }
 
   sendJson_(doc);
@@ -611,14 +633,6 @@ void WebPortalManager::handleAction_() {
   doc["ok"] = false;
   doc["message"] = "no handler";
   sendJson_(doc);
-}
-
-void WebPortalManager::addLogLine_(const String& line) {
-  String trimmed = line;
-  if (trimmed.length() > 120) trimmed = trimmed.substring(0, 120);
-  logs_[logHead_] = trimmed;
-  logHead_ = (logHead_ + 1) % kLogLines;
-  if (logCount_ < kLogLines) ++logCount_;
 }
 
 void WebPortalManager::sendJson_(JsonDocument& doc) {

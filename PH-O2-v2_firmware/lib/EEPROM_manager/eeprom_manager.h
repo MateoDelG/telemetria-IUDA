@@ -63,14 +63,16 @@ public:
   uint8_t  sampleCount() const;
 
   // --- Stabilization (ms) ---
-  void     setStabilizationMs(uint32_t ms);
-  uint32_t stabilizationMs() const;
+  void     setO2StabilizationMs(uint32_t ms);
+  uint32_t o2StabilizationMs() const;
+  void     setPhStabilizationMs(uint32_t ms);
+  uint32_t phStabilizationMs() const;
 
   // Último error
   const char* lastError() const { return _err; }
 
   // Versión del layout actual
-  static constexpr uint16_t kVersion = 0x0008;  // v8: añade calibración O2 (2pt)
+  static constexpr uint16_t kVersion = 0x0009;  // v9: split O2/pH stabilization
 
 private:
   // ====== Estructuras ======
@@ -79,7 +81,7 @@ private:
   struct PH3pt { float V4; float V7; float V10; float tC; };
   struct O2Cal { float V1_mV; float T1_C; float V2_mV; float T2_C; };
 
-  // ====== Estructura persistente (v7) ======
+  // ====== Estructura persistente (v9) ======
   struct ConfigData {
     uint16_t magic;     // 0xC0AD
     uint16_t version;   // kVersion
@@ -105,7 +107,8 @@ private:
 
     // Otros
     uint8_t  sample_count;       // 0..4 bombas sample
-    uint32_t stabilization_ms;   // Espera de mezcla/estabilización
+    uint32_t o2_stabilization_ms; // Espera de mezcla/estabilización O2
+    uint32_t ph_stabilization_ms; // Espera de estabilización pH
 
     uint32_t crc;                // CRC32 (sin incluir este campo)
   } __attribute__((packed));

@@ -23,8 +23,12 @@ public:
   void setLastResult(const String& r);
   void setLastHasData(bool v);
 
+  // Envío directo del último snapshot (mismo formato que get_last)
+  void sendLastSnapshot();
+
   // Solicitud de medición automática
   void setAutoMeasureRequested(bool v);
+  void setBusy(bool v);
 
   // ====== Getters de estado general ======
   bool   getLevelH2O() const;
@@ -38,13 +42,16 @@ public:
   bool   getLastHasData() const;
 
   bool   getAutoMeasureRequested() const;
+  bool   getBusy() const;
 
   // ====== Set/Get por SAMPLE (id 1..4) ======
   // Guarda/lee valores NUMÉRICOS (no bool) de pH y O2 por muestra.
   void  setSamplePhValueById(uint8_t id /*1..4*/, float v);
   void  setSampleO2ValueById(uint8_t id /*1..4*/, float v);
+  void  setSampleTempCById(uint8_t id /*1..4*/, float v);
   float getSamplePhValueById(uint8_t id /*1..4*/) const;
   float getSampleO2ValueById(uint8_t id /*1..4*/) const;
+  float getSampleTempCById(uint8_t id /*1..4*/) const;
 
 private:
   Stream& io_;
@@ -55,6 +62,7 @@ private:
   volatile bool   levelKCL_ok_ = false;
   volatile bool   auto_running_ = false;
   volatile bool   autoMeasureRequested_ = false;
+  volatile bool   busy_ = false;
 
   volatile float  last_ph_ = 7.0f;
   volatile float  last_o2_ = NAN;
@@ -65,6 +73,7 @@ private:
   // Estado por SAMPLE (S1..S4) — valores numéricos
   volatile float  sample_ph_val_[4] = {NAN, NAN, NAN, NAN};
   volatile float  sample_o2_val_[4] = {NAN, NAN, NAN, NAN};
+  volatile float  sample_tempC_[4] = {NAN, NAN, NAN, NAN};
 
 #if defined(ESP32)
   portMUX_TYPE mux_ = portMUX_INITIALIZER_UNLOCKED;

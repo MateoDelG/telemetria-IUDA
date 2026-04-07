@@ -30,10 +30,8 @@ public:
 private:
   void handleIndex_();
   void handleStatus_();
-  void handleLogs_();
   void handleAction_();
 
-  void addLogLine_(const String& line);
   void sendJson_(JsonDocument& doc);
 
   WebServer server_;
@@ -43,9 +41,5 @@ private:
   ConfigStore* eeprom_ = nullptr;
   ActionHandler actionHandler_ = nullptr;
 
-  static const size_t kLogLines = 80;
-  String logs_[kLogLines];
-  size_t logHead_ = 0;
-  size_t logCount_ = 0;
   bool started_ = false;
 };

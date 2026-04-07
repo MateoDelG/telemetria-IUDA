@@ -8,6 +8,7 @@
 #include "test_board.h"
 #include "uart_manager.h"
 #include "WebPortalManager.h"
+#include "services/console/console_service.h"
 #include <ArduinoJson.h>
 #include <Arduino.h>
 #include <globals.h>
@@ -27,6 +28,7 @@ O2Manager o2(&ads, /*channel=*/1, /*avgSamples=*/6);
 ConfigStore eeprom;
 LevelSensorsManager levels; 
 WebPortalManager webPortal(&pumps, &levels, &uart2, &eeprom);
+ConsoleService consoleService;
 
 volatile bool autoCancelRequest = false;
 
@@ -46,7 +48,6 @@ float readThermo();
 float readADC();
 float readPH();
 float readO2();
-static void webLogHook(const String& message);
 static bool handleWebAction(const String& action, const String& value, String& outMessage);
 
 void APIUI();
@@ -116,6 +117,7 @@ void taskCore1(void *pvParameters) {
     wifiManager.loop();
     remoteManager.handle();
     webPortal.loop();
+    consoleService.update();
     uart2.loop();
     vTaskDelay(200 / portTICK_PERIOD_MS); // Espera 100 ms
   }
@@ -156,10 +158,11 @@ void initWiFi() {
   wifiManager.begin();
   if (wifiManager.isConnected()) {
     remoteManager.begin(); // Solo si hay WiFi
-    remoteManager.setLogHook(webLogHook);
+    consoleService.begin();
+    remoteManager.setLogHook(ConsoleService::logSink);
     webPortal.setActionHandler(handleWebAction);
     webPortal.begin();
-    webPortal.log(String("Web portal listo en http://") + wifiManager.getLocalIP().toString());
+    remoteManager.log(String("Web portal listo en http://") + wifiManager.getLocalIP().toString());
   }
 }
 
@@ -387,10 +390,6 @@ void initO2() {
   }
 }
 
-static void webLogHook(const String& message) {
-  webPortal.log(message);
-}
-
 static bool handleWebAction(const String& action, const String& value, String& outMessage) {
   (void)value;
   if (action == "auto_start") {
@@ -439,7 +438,7 @@ static bool handleWebAction(const String& action, const String& value, String& o
     bool nowOn = !pumps.isOn(id);
     pumps.set(id, nowOn);
     outMessage = String("pump ") + value + (nowOn ? " on" : " off");
-    webPortal.log(outMessage);
+    remoteManager.log(outMessage);
     return true;
   }
   if (action == "set_times") {
@@ -470,7 +469,12 @@ static bool handleWebAction(const String& action, const String& value, String& o
     uint32_t drain = readU("drain_s", (uint32_t)(eeprom.drainMs() / 1000UL));
     uint32_t sampleTimeout = readU("sample_timeout_s", (uint32_t)(eeprom.sampleTimeoutMs() / 1000UL));
     uint32_t drainTimeout = readU("drain_timeout_s", (uint32_t)(eeprom.drainTimeoutMs() / 1000UL));
-    uint32_t stab = readU("stabilization_s", (uint32_t)(eeprom.stabilizationMs() / 1000UL));
+    static constexpr uint32_t kUnset = 0xFFFFFFFFUL;
+    uint32_t o2Stab = readU("o2_stabilization_s", kUnset);
+    if (o2Stab == kUnset) {
+      o2Stab = readU("stabilization_s", (uint32_t)(eeprom.o2StabilizationMs() / 1000UL));
+    }
+    uint32_t phStab = readU("ph_stabilization_s", (uint32_t)(eeprom.phStabilizationMs() / 1000UL));
     uint8_t sampleCount = readSampleCount("sample_count", (uint8_t)eeprom.sampleCount());
 
     eeprom.setKclFillMs(kclFill * 1000UL);
@@ -479,12 +483,13 @@ static bool handleWebAction(const String& action, const String& value, String& o
     eeprom.setDrainMs(drain * 1000UL);
     eeprom.setSampleTimeoutMs(sampleTimeout * 1000UL);
     eeprom.setDrainTimeoutMs(drainTimeout * 1000UL);
-    eeprom.setStabilizationMs(stab * 1000UL);
+    eeprom.setO2StabilizationMs(o2Stab * 1000UL);
+    eeprom.setPhStabilizationMs(phStab * 1000UL);
     eeprom.setSampleCount(sampleCount);
     eeprom.save();
 
     outMessage = "times saved";
-    webPortal.log(outMessage);
+    remoteManager.log(outMessage);
     return true;
   }
   outMessage = "unknown action";
@@ -1167,7 +1172,7 @@ static bool PumpTimeoutsWizard() {
   static const Item items[] = {
     { "SAMPLE",  ItemId::SAMPLE_T,  true  },
     { "DRAIN",   ItemId::DRAIN_T,   true  },
-    { "ESTAB",   ItemId::ESTAB_T,   true  },
+    { "O2 STAB", ItemId::ESTAB_T,   true  },
     { "SAMPLES", ItemId::SAMPLE_CNT,false },
   };
   static const uint8_t N = (uint8_t)ItemId::COUNT;
@@ -1186,7 +1191,7 @@ static bool PumpTimeoutsWizard() {
     switch(id){
       case ItemId::SAMPLE_T: return (int32_t)(eeprom.sampleTimeoutMs()/1000UL);
       case ItemId::DRAIN_T:  return (int32_t)(eeprom.drainTimeoutMs()/1000UL);
-      case ItemId::ESTAB_T:  return (int32_t)(eeprom.stabilizationMs()/1000UL);
+      case ItemId::ESTAB_T:  return (int32_t)(eeprom.o2StabilizationMs()/1000UL);
       default: return 0;
     }
   };
@@ -1195,7 +1200,7 @@ static bool PumpTimeoutsWizard() {
     switch(id){
       case ItemId::SAMPLE_T: eeprom.setSampleTimeoutMs(ms); break;
       case ItemId::DRAIN_T:  eeprom.setDrainTimeoutMs(ms);  break;
-      case ItemId::ESTAB_T:  eeprom.setStabilizationMs(ms); break;
+      case ItemId::ESTAB_T:  eeprom.setO2StabilizationMs(ms); break;
       default: break;
     }
   };
@@ -1622,6 +1627,7 @@ static bool AutoModeTick() {
     MIXER_ON,
     MIXER_OFF,
     WAIT,
+    READ_O2,
     READ_PH,
     END
   };
@@ -1630,7 +1636,8 @@ static bool AutoModeTick() {
     CONST,           // usa Step.ms
     SAMPLE_T,        // timeout de SAMPLE (fase 1)
     DRAIN_T,         // timeout de DRAIN  (fase 1)
-    MIX_WAIT_VAR     // estabilización configurable
+    MIX_WAIT_VAR,    // estabilización configurable O2
+    PH_WAIT_VAR      // estabilización configurable pH
   };
 
   struct Step {
@@ -1643,7 +1650,7 @@ static bool AutoModeTick() {
 
   // ---------- Tiempos ----------
   static uint32_t mixWaitMs = 30000;            // fallback
-  mixWaitMs = eeprom.stabilizationMs();
+  mixWaitMs = eeprom.o2StabilizationMs();
   static const uint32_t MSG_MS = 1500;
 
   // Timeouts (fase 1: esperar sensor)
@@ -1655,6 +1662,7 @@ static bool AutoModeTick() {
       case DurKind::SAMPLE_T:     return getSampleTimeoutMs();
       case DurKind::DRAIN_T:      return getDrainTimeoutMs();
       case DurKind::MIX_WAIT_VAR: return mixWaitMs;
+      case DurKind::PH_WAIT_VAR:  return eeprom.phStabilizationMs();
       case DurKind::CONST:        return 0;
       default:                    return 0;
     }
@@ -1672,7 +1680,7 @@ static bool AutoModeTick() {
       case PumpId::SAMPLE2:
       case PumpId::SAMPLE3:
       case PumpId::SAMPLE4: return getSampleFillMs();
-      case PumpId::DRAIN:   return getDrainTimeoutMs();
+      case PumpId::DRAIN:   return getDrainMs();
       default:              return 0;
     }
   };
@@ -1683,8 +1691,10 @@ static bool AutoModeTick() {
     { Op::PUMP_FOR,    PumpId::DRAIN,   DurKind::DRAIN_T,      0, "Drenando"    },
     { Op::PUMP_FOR,    PumpId::SAMPLE1, DurKind::SAMPLE_T,     0, "Sample"      }, // SAMPLE dinámico
     { Op::MIXER_ON,    PumpId::MIXER,   DurKind::CONST,        0, "Mixer ON"    },
-    { Op::WAIT,        PumpId::MIXER,   DurKind::MIX_WAIT_VAR, 0, "Mezclando"   },
+    { Op::WAIT,        PumpId::MIXER,   DurKind::MIX_WAIT_VAR, 0, "Mezclando O2" },
     { Op::MIXER_OFF,   PumpId::MIXER,   DurKind::CONST,        0, "Mixer OFF"   },
+    { Op::READ_O2,     PumpId::MIXER,   DurKind::CONST,        0, "Leer O2"     },
+    { Op::WAIT,        PumpId::MIXER,   DurKind::PH_WAIT_VAR,  0, "Espera pH"   },
     { Op::READ_PH,     PumpId::MIXER,   DurKind::CONST,        0, "Leer pH"     },
     { Op::PUMP_FOR,    PumpId::DRAIN,   DurKind::DRAIN_T,      0, "Drenando"    },
     // H2O: espera pH HIGH con timeout y luego FILL ascendente
@@ -1771,17 +1781,15 @@ static bool AutoModeTick() {
     return true;
   }
 
-  // ---------- Precondición: H2O y pH deben estar en HIGH ----------
+  // ---------- Precondición: H2O debe estar en HIGH ----------
   if (!started) {
     const bool h2oHigh = levels.h2o();
-    const bool phHigh  = levels.ph();
     const bool o2High  = levels.o2();
-    if (!h2oHigh || !phHigh) {
+    if (!h2oHigh) {
       const char* sH2O = h2oHigh ? "HI " : "LO ";
-      const char* sPH  = phHigh  ? "HI " : "LO ";
       const char* sO2  = o2High  ? "HI " : "LO ";
       char L0[17], L1[17];
-      snprintf(L0, sizeof(L0), "H2O:%s pH:%s", sH2O, sPH);
+      snprintf(L0, sizeof(L0), "H2O:%s", sH2O);
       snprintf(L1, sizeof(L1), "O2:%s", sO2);
       show(L0, L1);
       return false;
@@ -1954,6 +1962,7 @@ static bool AutoModeTick() {
 
         float phv = readPH();
         lastPHShown = phv;
+        float tC = readThermo();
 
         // Guardar en JSON del sample actual (1..4)
         uint8_t sampleId = (uint8_t)(currentSample + 1);
@@ -1962,8 +1971,7 @@ static bool AutoModeTick() {
 
         uart2.setLastPh(phv);
         uart2.setSamplePhValueById(sampleId, phv);
-
-        readO2();
+        uart2.setSampleTempCById(sampleId, tC);
 
         snprintf(L0, sizeof(L0), "pH: %.02f pH", phv);
         snprintf(L1, sizeof(L1), "OK");
@@ -1972,24 +1980,36 @@ static bool AutoModeTick() {
         tPost = millis();
         phase = Phase::POST;
       } else if (phase == Phase::POST) {
-        if (millis() - tPost >= MSG_MS) {
-          char L0[17], L1[17];
-          snprintf(L0, sizeof(L0), "Leyendo O2");
-          snprintf(L1, sizeof(L1), " ");
-          show(L0, L1);
-
-          float o2v = readO2();
-          snprintf(L0, sizeof(L0), "O2: %.03f mg/L", o2v);
-          snprintf(L1, sizeof(L1), "OK");
-          show(L0, L1);
-
-          tPost = millis();
-          phase = Phase::EXIT;
-        }
+        if (millis() - tPost >= MSG_MS) phase = Phase::EXIT;
       } else if (phase == Phase::EXIT) {
         if (millis() - tPost >= MSG_MS) {
           idx++; phase = Phase::ENTER;
         }
+      }
+    } break;
+
+    case Op::READ_O2: {
+      if (phase == Phase::ENTER) {
+        char L0[17], L1[17];
+        snprintf(L0, sizeof(L0), "Leyendo O2");
+        snprintf(L1, sizeof(L1), " ");
+        show(L0, L1);
+
+        float o2v = readO2();
+        uint8_t sampleId = (uint8_t)(currentSample + 1);
+        if (sampleId < 1) sampleId = 1;
+        if (sampleId > 4) sampleId = 4;
+        uart2.setSampleO2ValueById(sampleId, o2v);
+        snprintf(L0, sizeof(L0), "O2: %.03f mg/L", o2v);
+        snprintf(L1, sizeof(L1), "OK");
+        show(L0, L1);
+
+        tPost = millis();
+        phase = Phase::POST;
+      } else if (phase == Phase::POST) {
+        if (millis() - tPost >= MSG_MS) phase = Phase::EXIT;
+      } else if (phase == Phase::EXIT) {
+        idx++; phase = Phase::ENTER;
       }
     } break;
 
@@ -2014,6 +2034,7 @@ static bool AutoModeTick() {
 
       // Todo completado
       lcd.splash("AUTO OK", "Completado", 900);
+      uart2.sendLastSnapshot();
       started = false; idx = 0; phase = Phase::ENTER; lastPHShown = NAN;
       currentSample = 0; totalSamples = 0;
       return true;
@@ -2514,6 +2535,21 @@ static void MenuDemoTick() {
       renderTemp();
     }
   }
+
+  // ---- Estado de calibración (bloquea auto_measure por UART) ----
+  const bool calibBusy =
+    (view == View::CAL_ADS_MENU) ||
+    (view == View::CAL_ADS_READ) ||
+    (view == View::CAL_ADS_RUN)  ||
+    (view == View::CAL_PH_MENU)  ||
+    (view == View::CAL_PH_READ)  ||
+    (view == View::CAL_PH_RUN_2P) ||
+    (view == View::CAL_PH_RUN_3P_PW) ||
+    (view == View::CAL_O2_MENU)  ||
+    (view == View::CAL_O2_READ)  ||
+    (view == View::CAL_O2_RUN_1P) ||
+    (view == View::CAL_O2_RUN_2P);
+  uart2.setBusy(calibBusy);
 
   // ---- FSM ----
   switch (view) {

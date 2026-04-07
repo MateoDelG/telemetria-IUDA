@@ -52,7 +52,7 @@ bool ConfigStore::load() {
     return false;
   }
 
-  // Solo aceptamos la versión actual (v8)
+  // Solo aceptamos la versión actual (v9)
   if (version != kVersion) {
     strncpy(_err, "VERSION distinta (no soportada)", sizeof(_err)-1);
     return false;
@@ -127,7 +127,8 @@ void ConfigStore::resetDefaults() {
   _cfg.sample_count = 4;
 
   // Stabilization (ms)
-  _cfg.stabilization_ms = 30000;
+  _cfg.o2_stabilization_ms = 30000;
+  _cfg.ph_stabilization_ms = 30000;
 
   computeCrc_();
   _err[0] = '\0';
@@ -228,5 +229,7 @@ void    ConfigStore::setSampleCount(uint8_t n) { _cfg.sample_count = n; }
 uint8_t ConfigStore::sampleCount() const       { return _cfg.sample_count; }
 
 // ---- Stabilization ----
-void ConfigStore::setStabilizationMs(uint32_t ms) { _cfg.stabilization_ms = ms; }
-uint32_t ConfigStore::stabilizationMs() const     { return _cfg.stabilization_ms; }
+void ConfigStore::setO2StabilizationMs(uint32_t ms) { _cfg.o2_stabilization_ms = ms; }
+uint32_t ConfigStore::o2StabilizationMs() const     { return _cfg.o2_stabilization_ms; }
+void ConfigStore::setPhStabilizationMs(uint32_t ms) { _cfg.ph_stabilization_ms = ms; }
+uint32_t ConfigStore::phStabilizationMs() const     { return _cfg.ph_stabilization_ms; }

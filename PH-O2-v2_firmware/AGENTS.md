@@ -10,7 +10,7 @@ Default env: `esp32doit-devkit-v1`.
 Monitor speed: `115200` (matches `platformio.ini`).
 Extra scripts: `scripts/auto_uploader.py` picks serial first, OTA fallback.
 
-Common commands (run from repo root):
+Common commands (run from `PH-O2-v2_firmware/` repo root):
 - Build firmware: `pio run -e esp32doit-devkit-v1`
 - Upload firmware: `pio run -e esp32doit-devkit-v1 -t upload`
 - Clean build: `pio run -e esp32doit-devkit-v1 -t clean`
@@ -53,6 +53,7 @@ General
 - Avoid heavy dynamic allocation in hot paths; prefer stack buffers or
   fixed-size arrays (`char[]`, `snprintf`).
 - Use `F("...")` for constant strings stored in flash when appropriate.
+- Use `const`/`constexpr` for constants; avoid macros for typed values.
 - Prefer explicit `uint8_t`, `uint16_t`, `uint32_t`, `int32_t` types for
   hardware-facing code.
 - Clamp and validate sensor values before use (see `readPH()`/`readO2()`).
@@ -66,7 +67,9 @@ Formatting
 - For LCD UI or fixed-width output, use `snprintf` with 16x2 buffers.
 
 Includes
-- Project headers first with quotes: `#include "..."`.
+- Project headers first; prefer quotes: `#include "..."`.
+- Some files use `#include <globals.h>` due to include paths; keep the
+  existing style within the file for consistency.
 - Third-party and Arduino headers after, with angle brackets.
 - Keep include order stable within a file; avoid unused includes.
 - Prefer `#include <Arduino.h>` in `.cpp` files needing core types/macros.
